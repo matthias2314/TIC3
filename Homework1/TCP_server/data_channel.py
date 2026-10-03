@@ -1,0 +1,148 @@
+"""Data channel: receive and decode the samples sent by the ESP32 (TCP or UDP)."""
+import select
+import struct
+
+from protocol import (MSG_FMT, MSG_SIZE, U32_MASK, END_FMT, END_SIZE, END_CODE,
+                      scale_for)
+
+UDP_BUFFER = 2048          # larger than any valid datagram, so bad sizes can be detected
+END_GRACE = 0.2            # seconds to wait for datagrams still in flight after END
+
+
+class ClientClosed(ConnectionError):
+    """The client closed the connection cleanly (FIN)."""
+
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ClientClosed("client closed the connection")
+        buf += chunk
+    return buf
+
+
+class SampleTracker:
+    def __init__(self, config):
+        self.scale = scale_for(config.range_g)   # from THIS session's config
+        self.expected = config.num_samples
+        self.next_seq = 0            # every session starts at seq 0
+        self.pending = set()         # skipped so far: lost, or still on their way
+        self.last_t = None
+        self.received = 0            # arrived in order (the ones printed as data)
+        self.late = 0
+        self.duplicates = 0
+
+    def process(self, seq, t_us, ax, ay, az):
+        # --- Sequence check ---
+        if seq >= self.expected:
+            print(f"WARNING: seq={seq} is outside this session "
+                  f"(0..{self.expected - 1}), ignored")
+            return
+        if seq < self.next_seq:                  # behind: late or duplicate
+            if seq in self.pending:
+                self.pending.remove(seq)
+                self.late += 1
+                print(f"WARNING: seq={seq} arrived late, not shown (counted as late, not lost)")
+            else:
+                self.duplicates += 1
+                print(f"WARNING: duplicate seq={seq}, ignored")
+            return
+        if seq > self.next_seq:                  # ahead: something was skipped
+            self.pending.update(range(self.next_seq, seq))
+            print(f"WARNING: gap of {seq - self.next_seq} before seq={seq} (lost, or late)")
+        self.next_seq = seq + 1
+        self.received += 1
+
+        # --- Time between samples ---
+        if self.last_t is None:
+            dt_text = "    ---"
+        else:
+            dt_ms = ((t_us - self.last_t) & U32_MASK) / 1000
+            dt_text = f"{dt_ms:7.2f}"
+        self.last_t = t_us
+
+        # --- Conversion to m/s² ---
+        s = self.scale
+        print(f"seq={seq:5d}  dt={dt_text} ms  "
+              f"ax={ax * s:7.3f}  ay={ay * s:7.3f}  az={az * s:7.3f} m/s²")
+
+    def print_summary(self):
+        lost = self.expected - self.received - self.late
+        loss_pct = 100 * lost / self.expected
+        print("--- Session summary ---")
+        print(f"  expected:   {self.expected}")
+        print(f"  received:   {self.received} (in order)")
+        print(f"  late:       {self.late}")
+        print(f"  duplicates: {self.duplicates}")
+        print(f"  lost:       {lost} ({loss_pct:.1f} %)")
+
+
+def receive_samples_tcp(sock, config):
+    tracker = SampleTracker(config)
+    try:
+        while True:
+            msg = recv_exact(sock, MSG_SIZE)
+            tracker.process(*struct.unpack(MSG_FMT, msg))
+    finally:
+        tracker.print_summary()
+
+
+def read_datagram(sock, esp_ip, tracker):
+    """Read one datagram and process it if it is a sample from esp_ip."""
+    msg, (src_ip, _) = sock.recvfrom(UDP_BUFFER)
+    if src_ip != esp_ip:
+        print(f"Ignoring datagram from {src_ip}")
+    elif len(msg) != MSG_SIZE:
+        print(f"Ignoring datagram of {len(msg)} bytes (expected {MSG_SIZE})")
+    else:
+        tracker.process(*struct.unpack(MSG_FMT, msg))
+
+
+def receive_samples_udp(udp_sock, control, esp_ip, config):
+    tracker = SampleTracker(config)
+    timeout = udp_sock.gettimeout()
+    try:
+        while True:
+            # Wait until at least one of the two sockets has something to read
+            readable, _, _ = select.select([udp_sock, control], [], [], timeout)
+            if not readable:
+                raise TimeoutError("no samples and no END")
+
+            # Samples first: END is only looked at when no datagram is waiting
+            if udp_sock in readable:
+                read_datagram(udp_sock, esp_ip, tracker)
+                continue
+
+            # Only the control channel has something: it should be END
+            try:
+                (code,) = struct.unpack(END_FMT, recv_exact(control, END_SIZE))
+            except ClientClosed:
+                raise ConnectionError("control channel closed before END")
+            if code != END_CODE:
+                raise ConnectionError(f"unexpected control message 0x{code:02X}")
+
+            # END travels by TCP and can overtake the last datagrams: wait a
+            # moment for any that are still on their way.
+            while select.select([udp_sock], [], [], END_GRACE)[0]:
+                read_datagram(udp_sock, esp_ip, tracker)
+            return
+    finally:
+        tracker.print_summary()
+
+
+def drain_udp(sock):
+    """Discard datagrams left over from a previous session. Returns how many."""
+    timeout = sock.gettimeout()
+    sock.setblocking(False)          # recvfrom raises BlockingIOError when empty
+    discarded = 0
+    try:
+        while True:
+            sock.recvfrom(UDP_BUFFER)
+            discarded += 1
+    except BlockingIOError:
+        pass
+    finally:
+        sock.settimeout(timeout)     # back to the normal timeout
+    return discarded
