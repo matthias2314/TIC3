@@ -26,7 +26,6 @@ VALID_RANGES_G = (2, 4, 8, 16)
 # value the firmware writes to the sensor anyway.
 # BMI270 register ACC_CONF, field acc_odr: code -> Hz. Check against the datasheet.
 ODR_HZ = {
-    0x01: 0.78125, 0x02: 1.5625, 0x03: 3.125, 0x04: 6.25,
     0x05: 12.5,    0x06: 25.0,   0x07: 50.0,  0x08: 100.0,
     0x09: 200.0,   0x0A: 400.0,  0x0B: 800.0, 0x0C: 1600.0,
 }

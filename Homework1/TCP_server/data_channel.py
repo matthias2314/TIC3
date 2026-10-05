@@ -1,6 +1,8 @@
 """Data channel: receive and decode the samples sent by the ESP32 (TCP or UDP)."""
 import select
 import struct
+import time
+from collections import namedtuple
 
 from protocol import (MSG_FMT, MSG_SIZE, U32_MASK, END_FMT, END_SIZE, END_CODE,
                       scale_for)
@@ -8,12 +10,15 @@ from protocol import (MSG_FMT, MSG_SIZE, U32_MASK, END_FMT, END_SIZE, END_CODE,
 UDP_BUFFER = 2048          # larger than any valid datagram, so bad sizes can be detected
 END_GRACE = 0.2            # seconds to wait for datagrams still in flight after END
 
+Sample = namedtuple('Sample', 'seq t_s rx_s dt_ms ax ay az ax_raw ay_raw az_raw')
+
 
 class ClientClosed(ConnectionError):
     """The client closed the connection cleanly (FIN)."""
 
 
 def recv_exact(sock, n):
+    """Receive exactly n bytes from a TCP socket, or raise ClientClosed."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -29,17 +34,23 @@ class SampleTracker:
         self.expected = config.num_samples
         self.next_seq = 0            # every session starts at seq 0
         self.pending = set()         # skipped so far: lost, or still on their way
-        self.last_t = None
-        self.received = 0            # arrived in order (the ones printed as data)
+        self.last_t = None           # t_us of the previous sample
+        self.elapsed_us = 0          # ESP32 time since the first sample (never wraps)
+        self.first_rx = None         # RPi clock when the first sample arrived
+        self.received = 0            # arrived in order (the ones returned as Samples)
         self.late = 0
         self.duplicates = 0
 
     def process(self, seq, t_us, ax, ay, az):
+        """Check one message. Return a Sample, or None if it produces no data
+        (invalid, late or duplicate)."""
+        now = time.monotonic()                   # arrival time, RPi clock
+
         # --- Sequence check ---
         if seq >= self.expected:
             print(f"WARNING: seq={seq} is outside this session "
                   f"(0..{self.expected - 1}), ignored")
-            return
+            return None
         if seq < self.next_seq:                  # behind: late or duplicate
             if seq in self.pending:
                 self.pending.remove(seq)
@@ -48,59 +59,106 @@ class SampleTracker:
             else:
                 self.duplicates += 1
                 print(f"WARNING: duplicate seq={seq}, ignored")
-            return
+            return None
         if seq > self.next_seq:                  # ahead: something was skipped
             self.pending.update(range(self.next_seq, seq))
             print(f"WARNING: gap of {seq - self.next_seq} before seq={seq} (lost, or late)")
         self.next_seq = seq + 1
         self.received += 1
 
-        # --- Time between samples ---
+        # --- Timing, ESP32 clock ---
         if self.last_t is None:
-            dt_text = "    ---"
+            dt_ms = None
         else:
-            dt_ms = ((t_us - self.last_t) & U32_MASK) / 1000
-            dt_text = f"{dt_ms:7.2f}"
+            dt_us = (t_us - self.last_t) & U32_MASK
+            self.elapsed_us += dt_us             # adding the differences never wraps
+            dt_ms = dt_us / 1000
         self.last_t = t_us
+
+        # --- Timing, RPi clock ---
+        if self.first_rx is None:
+            self.first_rx = now
 
         # --- Conversion to m/s² ---
         s = self.scale
-        print(f"seq={seq:5d}  dt={dt_text} ms  "
-              f"ax={ax * s:7.3f}  ay={ay * s:7.3f}  az={az * s:7.3f} m/s²")
+        return Sample(
+            seq=seq,
+            t_s=self.elapsed_us / 1_000_000,
+            rx_s=now - self.first_rx,
+            dt_ms=dt_ms,
+            ax=ax * s, ay=ay * s, az=az * s,
+            ax_raw=ax, ay_raw=ay, az_raw=az,
+        )
 
-    def print_summary(self):
+    def stats(self):
         lost = self.expected - self.received - self.late
-        loss_pct = 100 * lost / self.expected
-        print("--- Session summary ---")
-        print(f"  expected:   {self.expected}")
-        print(f"  received:   {self.received} (in order)")
-        print(f"  late:       {self.late}")
-        print(f"  duplicates: {self.duplicates}")
-        print(f"  lost:       {lost} ({loss_pct:.1f} %)")
+        return {
+            'expected': self.expected,
+            'received': self.received,
+            'late': self.late,
+            'duplicates': self.duplicates,
+            'missing': len(self.pending),
+            'lost': lost,
+            'loss_pct': 100 * lost / self.expected,
+        }
 
 
-def receive_samples_tcp(sock, config):
+# ---------------------------------------------------------------------------
+# Consumers: functions that receive each Sample and do something with it
+# ---------------------------------------------------------------------------
+def print_sample(sample):
+    """Terminal consumer: print one line per sample."""
+    if sample.dt_ms is None:
+        dt_text = "    ---"
+    else:
+        dt_text = f"{sample.dt_ms:7.2f}"
+    print(f"seq={sample.seq:5d}  dt={dt_text} ms  "
+          f"ax={sample.ax:7.3f}  ay={sample.ay:7.3f}  az={sample.az:7.3f} m/s²")
+
+
+def print_summary(stats):
+    """Print the end-of-session summary from tracker.stats()."""
+    print("--- Session summary ---")
+    print(f"  expected:   {stats['expected']}")
+    print(f"  received:   {stats['received']} (in order)")
+    print(f"  late:       {stats['late']}")
+    print(f"  duplicates: {stats['duplicates']}")
+    print(f"  lost:       {stats['lost']} ({stats['loss_pct']:.1f} %)")
+
+
+def handle_message(msg, tracker, consumers):
+    """Unpack one 14-byte message, check it, and give the result to every consumer."""
+    sample = tracker.process(*struct.unpack(MSG_FMT, msg))
+    if sample is not None:
+        for consumer in consumers:
+            consumer(sample)
+
+
+# ---------------------------------------------------------------------------
+# Receiving
+# ---------------------------------------------------------------------------
+def receive_samples_tcp(sock, config, consumers):
     tracker = SampleTracker(config)
     try:
         while True:
             msg = recv_exact(sock, MSG_SIZE)
-            tracker.process(*struct.unpack(MSG_FMT, msg))
+            handle_message(msg, tracker, consumers)
     finally:
-        tracker.print_summary()
+        print_summary(tracker.stats())
 
 
-def read_datagram(sock, esp_ip, tracker):
-    """Read one datagram and process it if it is a sample from esp_ip."""
+def read_datagram(sock, esp_ip, tracker, consumers):
+    """Read one datagram and handle it if it is a sample from esp_ip."""
     msg, (src_ip, _) = sock.recvfrom(UDP_BUFFER)
     if src_ip != esp_ip:
         print(f"Ignoring datagram from {src_ip}")
     elif len(msg) != MSG_SIZE:
         print(f"Ignoring datagram of {len(msg)} bytes (expected {MSG_SIZE})")
     else:
-        tracker.process(*struct.unpack(MSG_FMT, msg))
+        handle_message(msg, tracker, consumers)
 
 
-def receive_samples_udp(udp_sock, control, esp_ip, config):
+def receive_samples_udp(udp_sock, control, esp_ip, config, consumers):
     tracker = SampleTracker(config)
     timeout = udp_sock.gettimeout()
     try:
@@ -112,7 +170,7 @@ def receive_samples_udp(udp_sock, control, esp_ip, config):
 
             # Samples first: END is only looked at when no datagram is waiting
             if udp_sock in readable:
-                read_datagram(udp_sock, esp_ip, tracker)
+                read_datagram(udp_sock, esp_ip, tracker, consumers)
                 continue
 
             # Only the control channel has something: it should be END
@@ -126,10 +184,10 @@ def receive_samples_udp(udp_sock, control, esp_ip, config):
             # END travels by TCP and can overtake the last datagrams: wait a
             # moment for any that are still on their way.
             while select.select([udp_sock], [], [], END_GRACE)[0]:
-                read_datagram(udp_sock, esp_ip, tracker)
+                read_datagram(udp_sock, esp_ip, tracker, consumers)
             return
     finally:
-        tracker.print_summary()
+        print_summary(tracker.stats())
 
 
 def drain_udp(sock):

@@ -9,7 +9,7 @@ from protocol import (Config, odr_code_for, STATUS_TEXT, ACK_OK,
                       TRANSPORT_TCP, TRANSPORT_UDP, MODE_SEQUENTIAL, MODE_PARALLEL)
 from control_channel import send_config, receive_ack
 from data_channel import (receive_samples_tcp, receive_samples_udp,
-                          drain_udp, ClientClosed)
+                          drain_udp, print_sample, ClientClosed)
 
 HOST = '0.0.0.0'          # all interfaces
 CONTROL_PORT = 10001
@@ -21,9 +21,6 @@ def read_config():
     """Build the session's Config from the command line (later: from the GUI)."""
     p = argparse.ArgumentParser(description="RPi acquisition server")
     p.add_argument('transport', nargs='?', choices=['tcp', 'udp'], default='tcp')
-
-    # --range is deliberately NOT checked here: the ESP32 is the one that
-    # validates it, so `--range 3` made for testing
     p.add_argument('--range', type=int, default=2, help="full scale in g: 2, 4, 8, 16")
     p.add_argument('--rate', type=float, default=100, help="sample rate in Hz, e.g. 12.5")
     p.add_argument('--mode', choices=['sequential', 'parallel'], default='sequential')
@@ -63,6 +60,7 @@ def open_udp(port):
 def main():
     config = read_config()
     use_udp = config.transport == TRANSPORT_UDP
+    consumers = [print_sample]        # who receives each sample (later: CSV, web page)
 
     with open_listener(CONTROL_PORT) as control_listener, \
          open_listener(DATA_PORT) as data_listener, \
@@ -101,7 +99,7 @@ def main():
                     # 2. DATA
                     if use_udp:
                         print("Receiving samples over UDP...")
-                        receive_samples_udp(udp_sock, control, address[0], config)
+                        receive_samples_udp(udp_sock, control, address[0], config, consumers)
                         print(f"Session with {address} finished (END received)")
                     else:
                         print("Waiting for the TCP data connection...")
@@ -114,7 +112,7 @@ def main():
                         data.settimeout(CLIENT_TIMEOUT)
                         print(f"Data connection from {data_address}")
                         with data:
-                            receive_samples_tcp(data, config)
+                            receive_samples_tcp(data, config, consumers)
 
             except ClientClosed:
                 print(f"Client {address} disconnected cleanly")
