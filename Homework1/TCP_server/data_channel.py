@@ -104,7 +104,8 @@ class SampleTracker:
 
 
 # ---------------------------------------------------------------------------
-# Consumers: functions that receive each Sample and do something with it
+# Consumers: functions that receive each Sample and do something with it.
+# Finishers: functions that receive the final stats when a session ends.
 # ---------------------------------------------------------------------------
 def print_sample(sample):
     """Terminal consumer: print one line per sample."""
@@ -117,7 +118,7 @@ def print_sample(sample):
 
 
 def print_summary(stats):
-    """Print the end-of-session summary from tracker.stats()."""
+    """Terminal finisher: print the end-of-session summary from tracker.stats()."""
     print("--- Session summary ---")
     print(f"  expected:   {stats['expected']}")
     print(f"  received:   {stats['received']} (in order)")
@@ -134,17 +135,24 @@ def handle_message(msg, tracker, consumers):
             consumer(sample)
 
 
+def finish_session(tracker, finishers):
+    """The session is over: give its final counters to every finisher."""
+    stats = tracker.stats()
+    for finish in finishers:
+        finish(stats)
+
+
 # ---------------------------------------------------------------------------
 # Receiving
 # ---------------------------------------------------------------------------
-def receive_samples_tcp(sock, config, consumers):
+def receive_samples_tcp(sock, config, consumers, finishers):
     tracker = SampleTracker(config)
     try:
         while True:
             msg = recv_exact(sock, MSG_SIZE)
             handle_message(msg, tracker, consumers)
     finally:
-        print_summary(tracker.stats())
+        finish_session(tracker, finishers)
 
 
 def read_datagram(sock, esp_ip, tracker, consumers):
@@ -158,7 +166,7 @@ def read_datagram(sock, esp_ip, tracker, consumers):
         handle_message(msg, tracker, consumers)
 
 
-def receive_samples_udp(udp_sock, control, esp_ip, config, consumers):
+def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers):
     tracker = SampleTracker(config)
     timeout = udp_sock.gettimeout()
     try:
@@ -187,7 +195,7 @@ def receive_samples_udp(udp_sock, control, esp_ip, config, consumers):
                 read_datagram(udp_sock, esp_ip, tracker, consumers)
             return
     finally:
-        print_summary(tracker.stats())
+        finish_session(tracker, finishers)
 
 
 def drain_udp(sock):

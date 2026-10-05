@@ -9,7 +9,8 @@ from protocol import (Config, odr_code_for, STATUS_TEXT, ACK_OK,
                       TRANSPORT_TCP, TRANSPORT_UDP, MODE_SEQUENTIAL, MODE_PARALLEL)
 from control_channel import send_config, receive_ack
 from data_channel import (receive_samples_tcp, receive_samples_udp,
-                          drain_udp, print_sample, ClientClosed)
+                          drain_udp, print_sample, print_summary, ClientClosed)
+from storage import CsvWriter
 
 HOST = '0.0.0.0'          # all interfaces
 CONTROL_PORT = 10001
@@ -57,10 +58,22 @@ def open_udp(port):
     return s
 
 
+def session_outputs(config):
+    """Decide where one session's results go. Call it once per session.
+
+    Returns two lists of functions:
+      consumers  receive each Sample
+      finishers  receive the final stats when the session ends
+    """
+    writer = CsvWriter(config)                       # opens a new file
+    consumers = [print_sample, writer.write]
+    finishers = [print_summary, writer.close]
+    return consumers, finishers
+
+
 def main():
     config = read_config()
     use_udp = config.transport == TRANSPORT_UDP
-    consumers = [print_sample]        # who receives each sample (later: CSV, web page)
 
     with open_listener(CONTROL_PORT) as control_listener, \
          open_listener(DATA_PORT) as data_listener, \
@@ -99,7 +112,9 @@ def main():
                     # 2. DATA
                     if use_udp:
                         print("Receiving samples over UDP...")
-                        receive_samples_udp(udp_sock, control, address[0], config, consumers)
+                        consumers, finishers = session_outputs(config)
+                        receive_samples_udp(udp_sock, control, address[0], config,
+                                            consumers, finishers)
                         print(f"Session with {address} finished (END received)")
                     else:
                         print("Waiting for the TCP data connection...")
@@ -112,7 +127,8 @@ def main():
                         data.settimeout(CLIENT_TIMEOUT)
                         print(f"Data connection from {data_address}")
                         with data:
-                            receive_samples_tcp(data, config, consumers)
+                            consumers, finishers = session_outputs(config)
+                            receive_samples_tcp(data, config, consumers, finishers)
 
             except ClientClosed:
                 print(f"Client {address} disconnected cleanly")

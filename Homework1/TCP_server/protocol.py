@@ -1,7 +1,7 @@
+"""Shared definitions for both channels (used by the RPi and by the ESP32 side)."""
 import struct
 from collections import namedtuple
 
-#Data channel (TCP or UDP)
 MSG_FMT = '<IIhhh'
 MSG_SIZE = struct.calcsize(MSG_FMT)        # 14 bytes
 
@@ -14,17 +14,12 @@ def scale_for(range_g):
     return range_g * G / 32768
 
 
-# Control channel: RPi <-> ESP32 (always TCP)
 CONFIG_FMT = '<BBBBI'
 CONFIG_SIZE = struct.calcsize(CONFIG_FMT)  # 8 bytes
 Config = namedtuple('Config', 'range_g odr_code transport read_mode num_samples')
 
 VALID_RANGES_G = (2, 4, 8, 16)
 
-# The rate travels as the sensor's register code, not as a number in Hz:
-# it is exact (12.5 Hz has no rounding problem), takes 1 byte, and is the
-# value the firmware writes to the sensor anyway.
-# BMI270 register ACC_CONF, field acc_odr: code -> Hz. Check against the datasheet.
 ODR_HZ = {
     0x05: 12.5,    0x06: 25.0,   0x07: 50.0,  0x08: 100.0,
     0x09: 200.0,   0x0A: 400.0,  0x0B: 800.0, 0x0C: 1600.0,
@@ -32,6 +27,7 @@ ODR_HZ = {
 
 
 def odr_code_for(rate_hz):
+    """Return the BMI270 code for rate_hz, or raise ValueError if it isn't a valid rate."""
     for code, hz in ODR_HZ.items():
         if hz == rate_hz:
             return code
@@ -43,6 +39,18 @@ TRANSPORT_UDP = 1
 
 MODE_SEQUENTIAL = 0
 MODE_PARALLEL = 1
+
+
+def describe_config(config):
+    """The config as a dictionary with readable values (for files and for the web page)."""
+    return {
+        'range_g': config.range_g,
+        'rate_hz': ODR_HZ.get(config.odr_code),
+        'transport': 'udp' if config.transport == TRANSPORT_UDP else 'tcp',
+        'mode': 'parallel' if config.read_mode == MODE_PARALLEL else 'sequential',
+        'num_samples': config.num_samples,
+    }
+
 
 # ACK (ESP32 -> RPi): one status byte answering the CONFIG
 ACK_FMT = '<B'
@@ -62,10 +70,6 @@ STATUS_TEXT = {
     ERR_SAMPLES: "invalid number of samples",
 }
 
-# END (ESP32 -> RPi): "I have sent every sample of this session".
-# Used only when the data goes over UDP. With TCP data, closing the data
-# connection (FIN) already is a reliable end signal. UDP has no close, so the
-# end is announced on the control channel, which is TCP and cannot lose it.
 END_FMT = '<B'
 END_SIZE = struct.calcsize(END_FMT)        # 1 byte
 END_CODE = 0xFF
