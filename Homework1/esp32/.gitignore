@@ -1,0 +1,5 @@
+# Datos de la red (clave del WiFi): nunca se suben
+main/secrets.h
+
+# Copias de respaldo
+*.bak

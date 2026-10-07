@@ -1,4 +1,5 @@
 
+
 /* BMI270 sobre ESP32-S3 — TODO EN UN SOLO ARCHIVO
  * ============================================================================
  *
@@ -39,16 +40,56 @@
  * ESP-IDF v5.4.1
  * ============================================================================ */
 
+/* MODIFICADO PARA LA TAREA 1 (TIC 3)
+ * ============================================================================
+ *
+ * El driver (bus I2C y BMI270) está tal cual, sin tocar. Lo que cambió:
+ *
+ *   - Al final hay una sección nueva, "RED Y ADQUISICIÓN": WiFi, canal de
+ *     control, canal de datos (TCP o UDP) y los modos secuencial y paralelo.
+ *   - app_main ya no imprime muestras por el monitor serie: se conecta al
+ *     servidor (server.py), recibe la configuración y envía las muestras.
+ *   - SAMPLE_PERIOD_MS y bmi270_read() ya no se usan. Quedan como referencia.
+ *
+ * Por eso dos cosas del encabezado original ya no valen para este proyecto:
+ *
+ *   - main/CMakeLists.txt SÍ declara componentes (esp_wifi, lwip, esp_timer...).
+ *   - Se compila con ESP-IDF v6.1, no con v5.4.1.
+ *
+ * ANTES DE COMPILAR
+ *     Copiar main/secrets.h.example a main/secrets.h y poner ahí el nombre y
+ *     la clave del WiFi y la IP del computador que corre server.py.
+ *
+ * AJUSTES DEL PROYECTO (están en sdkconfig.defaults)
+ *     CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384   la carga del config_file del
+ *                                             sensor ocupa ~8 KB de stack
+ *     CONFIG_FREERTOS_HZ=1000                 tick de 1 ms; con el valor por
+ *                                             defecto (100) no se puede
+ *                                             muestrear a más de ~100 Hz
+ * ============================================================================ */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_event.h"
+
+#include "secrets.h"   // WIFI_SSID, WIFI_PASS, SERVER_IP (no se sube a git)
 
 
 /*****************************************************************/
@@ -1146,46 +1187,567 @@ esp_err_t bmi270_deinit(void) {
 
 
 /*****************************************************************/
-/*************************** DEMO ********************************/
+/******************** RED Y ADQUISICIÓN **************************/
 /*****************************************************************/
+
+/* Todo lo que sigue se agregó al driver original para hablar con el servidor
+ * (server.py). Es el mismo protocolo de protocol.py, y hace lo mismo que
+ * esp_test.py, pero con el sensor real:
+ *
+ *   1. CONTROL (TCP, puerto 10001): el ESP32 se conecta, recibe CONFIG
+ *      (8 bytes), lo valida y responde un ACK (1 byte).
+ *   2. Programa el rango y la frecuencia pedidos en el acelerómetro.
+ *   3. DATOS (TCP o UDP, puerto 10000): envía num_samples muestras de 14 bytes.
+ *   4. FIN: con TCP, cerrar la conexión de datos. Con UDP, enviar END (0xFF)
+ *      por el canal de control.
+ *
+ * WIFI_SSID, WIFI_PASS y SERVER_IP están en main/secrets.h. */
+
+#define CONTROL_PORT            10001
+#define DATA_PORT               10000
+
+#define TRANSPORT_TCP           0
+#define TRANSPORT_UDP           1
+#define MODE_SEQUENTIAL         0
+#define MODE_PARALLEL           1
+
+/* Códigos del ACK y de END: los mismos de protocol.py. */
+#define ACK_OK                  0
+#define ERR_RANGE               1
+#define ERR_RATE                2
+#define ERR_TRANSPORT           3
+#define ERR_MODE                4
+#define ERR_SAMPLES             5
+#define END_CODE                0xFF
+
+/* 1 = una sola sesión por encendido: al terminar, el ESP32 se queda quieto
+ *     hasta que se presione RESET.
+ * 0 = al terminar se reconecta solo y espera el siguiente CONFIG.
+ *
+ * Hoy server.py envía CONFIG apenas alguien se conecta, así que con 0 se
+ * grabaría una sesión tras otra sin parar. Cambiar a 0 cuando el servidor
+ * inicie las sesiones a pedido (desde la página web). */
+#define ONE_SESSION_PER_BOOT    1
+
+#define RECONNECT_DELAY_MS      2000    // espera antes de reintentar la conexión de control
+#define NO_DATA_TIMEOUT_US      2000000 // si el sensor no entrega nada en 2 s, se corta la sesión
+#define PARALLEL_QUEUE_LEN      100     // muestras que caben en la cola del modo paralelo
+
+/* Los dos mensajes binarios. `packed` evita que el compilador agregue relleno:
+ * sin él, la muestra mediría 16 bytes en vez de 14 y el servidor leería basura.
+ * El ESP32 es little-endian, igual que '<' en struct de Python. */
+typedef struct __attribute__((packed)) {
+    uint8_t  range_g;       // 2, 4, 8 o 16
+    uint8_t  odr_code;      // código de registro del BMI270: 0x05 (12.5 Hz) ... 0x0C (1600 Hz)
+    uint8_t  transport;     // TRANSPORT_TCP o TRANSPORT_UDP
+    uint8_t  read_mode;     // MODE_SEQUENTIAL o MODE_PARALLEL
+    uint32_t num_samples;   // muestras de la sesión
+} control_config_t;         // '<BBBBI' en protocol.py
+
+typedef struct __attribute__((packed)) {
+    uint32_t seq;           // número de muestra; parte en 0 en cada sesión
+    uint32_t t_us;          // reloj del ESP32 en microsegundos (da la vuelta cada 71.6 min)
+    int16_t  ax;            // valores crudos del sensor
+    int16_t  ay;
+    int16_t  az;
+} data_msg_t;               // '<IIhhh' en protocol.py
+
+_Static_assert(sizeof(control_config_t) == 8,  "CONFIG debe medir 8 bytes");
+_Static_assert(sizeof(data_msg_t) == 14,       "la muestra debe medir 14 bytes");
+
+
+/* ------------------------------- WiFi -------------------------------- */
+
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "WiFi desconectado (motivo %d). Reintentando...", d->reason);
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "IP del ESP32: " IPSTR, IP2STR(&e->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void) {
+    esp_err_t ret_nvs = nvs_flash_init();
+    if (ret_nvs == ESP_ERR_NVS_NO_FREE_PAGES || ret_nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret_nvs = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret_nvs);
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "Conectando a WiFi (%s)...", WIFI_SSID);
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "WiFi conectado!");
+}
+
+
+/* ------------------------ Enviar y recibir --------------------------- */
+
+/* Recibe exactamente `len` bytes. TCP entrega un flujo de bytes, no mensajes:
+ * un recv() puede devolver menos de lo pedido. Es el recv_exact de Python.
+ * Devuelve false si el servidor cerró la conexión o hubo un error. */
+static bool recv_exact(int sock, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        int r = recv(sock, p + got, len - got, 0);
+        if (r <= 0) {
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+
+/* Envía exactamente `len` bytes por un socket TCP. Devuelve false si falla. */
+static bool send_all(int sock, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        int r = send(sock, p + sent, len - sent, 0);
+        if (r <= 0) {
+            return false;
+        }
+        sent += (size_t)r;
+    }
+    return true;
+}
+
+static uint32_t s_udp_send_errors = 0;
+
+/* Envía una muestra por el canal de datos. Devuelve false solo si hay que
+ * cortar la sesión (la conexión TCP se cayó). */
+static bool send_sample(int data_sock, uint8_t transport, const struct sockaddr_in *dest,
+                        const data_msg_t *msg) {
+    if (transport == TRANSPORT_TCP) {
+        return send_all(data_sock, msg, sizeof(*msg));
+    }
+    /* UDP: un datagrama por muestra. Si no se puede enviar (por ejemplo, con
+     * los buffers del WiFi llenos) la muestra simplemente se pierde, y el
+     * servidor lo verá como un hueco en seq. No es motivo para cortar. */
+    if (sendto(data_sock, msg, sizeof(*msg), 0, (const struct sockaddr *)dest, sizeof(*dest)) < 0) {
+        s_udp_send_errors++;
+    }
+    return true;
+}
+
+
+/* ----------------------------- Sensor -------------------------------- */
+
+/* Lee una muestra CRUDA del acelerómetro: tres int16, sin convertir ni
+ * imprimir (la conversión a m/s^2 la hace el servidor, con el rango de la
+ * sesión). Son los mismos pasos que la primera mitad de bmi270_read().
+ *
+ * Devuelve ESP_ERR_NOT_FINISHED si todavía no hay una muestra nueva: eso no
+ * es un fallo. Cualquier otro error sí lo es. */
+static esp_err_t bmi270_read_raw(int16_t *ax, int16_t *ay, int16_t *az) {
+    if (!is_bmi270_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t reg_status = 0x03, status;
+    uint8_t reg_data = 0x0C, buf[6];        // 6 bytes: solo el acelerómetro
+
+    esp_err_t err = device_read(s_dev, &reg_status, &status, 1, TAG);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if ((status & 0x80) == 0) {             // bit 7: hay muestra nueva de aceleración
+        return ESP_ERR_NOT_FINISHED;
+    }
+
+    err = device_read(s_dev, &reg_data, buf, sizeof(buf), TAG);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *ax = (int16_t)(((uint16_t)buf[1] << 8) | buf[0]);
+    *ay = (int16_t)(((uint16_t)buf[3] << 8) | buf[2]);
+    *az = (int16_t)(((uint16_t)buf[5] << 8) | buf[4]);
+    return ESP_OK;
+}
+
+/* Espera la próxima muestra del sensor y arma el mensaje número `seq`.
+ * Devuelve ESP_OK, o un error si el sensor falla o deja de entregar datos
+ * (para que una sesión nunca se quede esperando para siempre). */
+static esp_err_t wait_sample(uint32_t seq, data_msg_t *msg) {
+    int64_t start = esp_timer_get_time();
+    while (true) {
+        int16_t ax, ay, az;
+        esp_err_t err = bmi270_read_raw(&ax, &ay, &az);
+        if (err == ESP_OK) {
+            msg->seq = seq;
+            msg->t_us = (uint32_t)esp_timer_get_time();
+            msg->ax = ax;
+            msg->ay = ay;
+            msg->az = az;
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NOT_FINISHED) {
+            return err;
+        }
+        if (esp_timer_get_time() - start > NO_DATA_TIMEOUT_US) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);      // un tick: 1 ms con CONFIG_FREERTOS_HZ=1000
+    }
+}
+
+/* Revisa el CONFIG como lo hace validate() en esp_test.py. Devuelve el código
+ * para el ACK. Si es válido, deja en *odr_macro el valor que espera acc_conf():
+ * por la red viaja el código de registro, pero acc_conf() recibe la macro
+ * BMI270_ODR_... */
+static uint8_t validate_config(const control_config_t *cfg, int *odr_macro) {
+    if (cfg->range_g != 2 && cfg->range_g != 4 && cfg->range_g != 8 && cfg->range_g != 16) {
+        return ERR_RANGE;
+    }
+    switch (cfg->odr_code) {
+        case 0x05: *odr_macro = BMI270_ODR_12_5; break;
+        case 0x06: *odr_macro = BMI270_ODR_25;   break;
+        case 0x07: *odr_macro = BMI270_ODR_50;   break;
+        case 0x08: *odr_macro = BMI270_ODR_100;  break;
+        case 0x09: *odr_macro = BMI270_ODR_200;  break;
+        case 0x0A: *odr_macro = BMI270_ODR_400;  break;
+        case 0x0B: *odr_macro = BMI270_ODR_800;  break;
+        case 0x0C: *odr_macro = BMI270_ODR_1600; break;
+        default:   return ERR_RATE;
+    }
+    if (cfg->transport != TRANSPORT_TCP && cfg->transport != TRANSPORT_UDP) {
+        return ERR_TRANSPORT;
+    }
+    if (cfg->read_mode != MODE_SEQUENTIAL && cfg->read_mode != MODE_PARALLEL) {
+        return ERR_MODE;
+    }
+    if (cfg->num_samples == 0) {
+        return ERR_SAMPLES;
+    }
+    return ACK_OK;
+}
+
+/* Programa en el acelerómetro el rango y la frecuencia de la sesión. El sensor
+ * ya está inicializado desde el arranque: acá solo se reescriben esos dos
+ * registros, así que no hace falta repetir bmi270_init(). */
+static bool apply_sensor_config(const control_config_t *cfg, int odr_macro) {
+    acc_conf(odr_macro, ACC_AVG, cfg->range_g);
+    if (ret != ESP_OK) {    // acc_conf() no devuelve nada: deja su resultado en `ret`
+        ESP_LOGE(TAG, "No se pudo configurar el acelerometro: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    /* Descarta una muestra que pudo quedar lista con la configuración anterior. */
+    int16_t ax, ay, az;
+    bmi270_read_raw(&ax, &ay, &az);
+    return true;
+}
+
+
+/* --------------------------- Modo paralelo --------------------------- */
+
+/* Dos tareas unidas por una cola: read_task lee el sensor a su ritmo y deja
+ * cada muestra en la cola; la tarea principal las saca y las envía. Un envío
+ * lento ya no atrasa la lectura.
+ *
+ * Solo read_task toca el bus I2C mientras dura la adquisición, así que sigue
+ * sin hacer falta un mutex de bus. */
+static QueueHandle_t s_data_queue = NULL;
+static SemaphoreHandle_t s_reader_done = NULL;  // read_task lo entrega justo antes de terminar
+static volatile bool s_stop_reader = false;     // la tarea principal pide a read_task que pare
+static volatile bool s_reader_failed = false;   // el sensor falló en read_task
+static volatile uint32_t s_dropped = 0;         // muestras descartadas por cola llena
+
+static void parallel_read_task(void *arg) {
+    const control_config_t *cfg = (const control_config_t *)arg;
+    uint32_t seq = 0;
+
+    while (seq < cfg->num_samples && !s_stop_reader) {
+        data_msg_t msg;
+        esp_err_t err = wait_sample(seq, &msg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Lectura del sensor fallo: %s", esp_err_to_name(err));
+            s_reader_failed = true;
+            break;
+        }
+        seq++;
+
+        /* Sin espera: si la cola está llena, la muestra se descarta. Como seq
+         * ya avanzó, el servidor verá el hueco y lo contará como pérdida.
+         * (Esperar acá frenaría la lectura, y la pérdida quedaría oculta.) */
+        if (xQueueSend(s_data_queue, &msg, 0) != pdTRUE) {
+            s_dropped++;
+        }
+    }
+
+    xSemaphoreGive(s_reader_done);
+    vTaskDelete(NULL);
+}
+
+/* Lado emisor del modo paralelo. Devuelve cuántas muestras envió y deja en
+ * *ok si la sesión terminó bien. */
+static uint32_t run_parallel(int data_sock, const control_config_t *cfg,
+                             const struct sockaddr_in *dest, bool *ok) {
+    uint32_t sent = 0;
+
+    s_data_queue = xQueueCreate(PARALLEL_QUEUE_LEN, sizeof(data_msg_t));
+    s_reader_done = xSemaphoreCreateBinary();
+    s_stop_reader = false;
+    s_reader_failed = false;
+    s_dropped = 0;
+
+    if (s_data_queue == NULL || s_reader_done == NULL ||
+        xTaskCreatePinnedToCore(parallel_read_task, "read_task", 4096, (void *)cfg, 5, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "No se pudo iniciar el modo paralelo (sin memoria)");
+        if (s_data_queue != NULL) vQueueDelete(s_data_queue);
+        if (s_reader_done != NULL) vSemaphoreDelete(s_reader_done);
+        *ok = false;
+        return 0;
+    }
+
+    bool reader_finished = false;
+    while (true) {
+        data_msg_t msg;
+        TickType_t wait = reader_finished ? 0 : pdMS_TO_TICKS(50);
+        if (xQueueReceive(s_data_queue, &msg, wait) == pdTRUE) {
+            if (!send_sample(data_sock, cfg->transport, dest, &msg)) {
+                ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
+                *ok = false;
+                break;
+            }
+            sent++;
+            continue;
+        }
+        if (reader_finished) {
+            break;              // cola vacía y ya no va a llegar nada más
+        }
+        if (xSemaphoreTake(s_reader_done, 0) == pdTRUE) {
+            reader_finished = true;     // una vuelta más, para vaciar lo que quedó en la cola
+        }
+    }
+
+    /* Antes de borrar la cola hay que estar seguro de que read_task terminó. */
+    s_stop_reader = true;
+    if (!reader_finished) {
+        xSemaphoreTake(s_reader_done, portMAX_DELAY);
+    }
+    vQueueDelete(s_data_queue);
+    vSemaphoreDelete(s_reader_done);
+    s_data_queue = NULL;
+    s_reader_done = NULL;
+
+    if (s_reader_failed) {
+        *ok = false;
+    }
+    if (s_dropped > 0) {
+        ESP_LOGW(TAG, "Cola llena: %lu muestras descartadas", (unsigned long)s_dropped);
+    }
+    return sent;
+}
+
+
+/* --------------------------- Modo secuencial ------------------------- */
+
+/* Una sola tarea lee y envía, una cosa después de la otra. Si un envío se
+ * demora, la siguiente lectura se atrasa. */
+static uint32_t run_sequential(int data_sock, const control_config_t *cfg,
+                               const struct sockaddr_in *dest, bool *ok) {
+    uint32_t seq = 0;
+
+    while (seq < cfg->num_samples) {
+        data_msg_t msg;
+        esp_err_t err = wait_sample(seq, &msg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Lectura del sensor fallo: %s", esp_err_to_name(err));
+            *ok = false;
+            break;
+        }
+        seq++;
+
+        if (!send_sample(data_sock, cfg->transport, dest, &msg)) {
+            ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
+            *ok = false;
+            break;
+        }
+    }
+    return seq;
+}
+
+
+/* ------------------------------ Sesión ------------------------------- */
+
+/* Canal de datos: abre el socket, envía las muestras y avisa el final. */
+static void run_acquisition(int control_sock, const control_config_t *cfg,
+                            const struct sockaddr_in *server_addr) {
+    struct sockaddr_in dest = *server_addr;
+    dest.sin_port = htons(DATA_PORT);
+
+    int data_sock = socket(AF_INET, (cfg->transport == TRANSPORT_TCP) ? SOCK_STREAM : SOCK_DGRAM, 0);
+    if (data_sock < 0) {
+        ESP_LOGE(TAG, "No se pudo crear el socket de datos (errno %d)", errno);
+        return;
+    }
+
+    if (cfg->transport == TRANSPORT_TCP) {
+        if (connect(data_sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
+            ESP_LOGE(TAG, "Fallo la conexion de datos TCP (errno %d)", errno);
+            close(data_sock);
+            return;
+        }
+        ESP_LOGI(TAG, "Conexion TCP de datos establecida");
+    } else {
+        ESP_LOGI(TAG, "Socket UDP de datos creado");
+    }
+
+    bool ok = true;
+    uint32_t sent;
+    s_udp_send_errors = 0;
+
+    if (cfg->read_mode == MODE_SEQUENTIAL) {
+        sent = run_sequential(data_sock, cfg, &dest, &ok);
+    } else {
+        sent = run_parallel(data_sock, cfg, &dest, &ok);
+    }
+
+    /* Fin de la sesión. Con UDP no existe "cerrar", así que se avisa con END
+     * por el canal de control, que es TCP y no se pierde. Se envía aunque la
+     * sesión haya terminado mal, para que el servidor no se quede esperando.
+     * Con TCP, cerrar la conexión de datos ya es el aviso. */
+    if (cfg->transport == TRANSPORT_UDP) {
+        uint8_t end_msg = END_CODE;
+        if (!send_all(control_sock, &end_msg, 1)) {
+            ESP_LOGW(TAG, "No se pudo enviar END por el canal de control");
+        }
+    }
+    close(data_sock);
+
+    if (s_udp_send_errors > 0) {
+        ESP_LOGW(TAG, "%lu datagramas UDP no se pudieron enviar", (unsigned long)s_udp_send_errors);
+    }
+    ESP_LOGI(TAG, "Adquisicion %s: %lu de %lu muestras enviadas",
+             ok ? "finalizada" : "INTERRUMPIDA",
+             (unsigned long)sent, (unsigned long)cfg->num_samples);
+}
+
+/* Atiende una conexión de control: recibe CONFIG, responde el ACK y, si el
+ * CONFIG es válido, corre la adquisición. Devuelve true si hubo adquisición. */
+static bool handle_control(int control_sock, const struct sockaddr_in *server_addr) {
+    control_config_t cfg;
+    if (!recv_exact(control_sock, &cfg, sizeof(cfg))) {
+        ESP_LOGW(TAG, "El servidor cerro el control sin enviar CONFIG");
+        return false;
+    }
+
+    int odr_macro = 0;
+    uint8_t ack = validate_config(&cfg, &odr_macro);
+    if (!send_all(control_sock, &ack, 1)) {
+        ESP_LOGE(TAG, "No se pudo enviar el ACK");
+        return false;
+    }
+    if (ack != ACK_OK) {
+        ESP_LOGW(TAG, "Configuracion rechazada. ACK=%d", ack);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Config OK: range=%d, odr=0x%02x, trans=%d, mode=%d, samples=%lu",
+             cfg.range_g, cfg.odr_code, cfg.transport, cfg.read_mode, (unsigned long)cfg.num_samples);
+
+    if (!apply_sensor_config(&cfg, odr_macro)) {
+        return false;
+    }
+
+    run_acquisition(control_sock, &cfg, server_addr);
+    return true;
+}
+
 
 static i2c_master_bus_handle_t bus_handle = NULL;
 
 void app_main(void) {
-    ESP_LOGI(TAG, "=== BMI270 standalone ===");
+    ESP_LOGI(TAG, "=== BMI270 Sistema de Adquisicion Red ===");
 
     /* 1. Bus I2C con el pinout de la placa. */
     ESP_ERROR_CHECK(i2c_master_init(&bus_handle));
-    ESP_LOGI(TAG, "bus I2C listo (SDA=%d SCL=%d, %lu Hz)",
-             I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO, (unsigned long)I2C_MASTER_FREQ_HZ);
+    ESP_LOGI(TAG, "bus I2C listo (SDA=%d SCL=%d)", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
 
-    /* 2. Sensor. Sube el archivo de configuración al chip -tarda un momento- y
-     *    programa los rangos y las tasas de muestreo. */
-    ret = bmi270_init(bus_handle, ACC_ODR, ACC_AVG, ACC_RANGE, GYR_ODR, GYR_RANGE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo inicializar el BMI270: %s", esp_err_to_name(ret));
+    /* 2. Sensor. Se inicializa UNA sola vez, con la configuración por defecto;
+     *    cada sesión después solo cambia rango y frecuencia (apply_sensor_config).
+     *
+     *    Tiene que llamarse desde app_main: subir el archivo de configuración
+     *    al chip ocupa ~8 KB de stack, y por eso el proyecto fija
+     *    CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384 en sdkconfig.defaults. */
+    esp_err_t err = bmi270_init(bus_handle, ACC_ODR, ACC_AVG, ACC_RANGE, GYR_ODR, GYR_RANGE);
+    if (err != ESP_OK || !is_bmi270_active) {
+        ESP_LOGE(TAG, "No se pudo inicializar el BMI270: %s", esp_err_to_name(err));
         ESP_LOGE(TAG, "Revisar: cableado SDA/SCL, alimentación, y que la dirección");
         ESP_LOGE(TAG, "sea 0x%02X (SDO a GND) y no 0x69 (SDO a VDD).", BMI270_SLAVE_ADDR);
         return;
     }
 
-    ESP_LOGI(TAG, "acelerometro +/-%d g   giroscopio +/-%d deg/s   ODR %d Hz",
-             ACC_RANGE, GYR_RANGE, ACC_ODR);
-    ESP_LOGI(TAG, "En reposo y horizontal: acc_z ~ 9.81, el resto ~ 0");
+    /* 3. WiFi. */
+    if (strcmp(WIFI_SSID, "TU_WIFI") == 0) {
+        ESP_LOGE(TAG, "Falta configurar la red: edita main/secrets.h con el nombre y la");
+        ESP_LOGE(TAG, "clave de tu WiFi y la IP del computador que corre server.py.");
+        return;
+    }
+    wifi_init_sta();
 
-    /* 3. Lectura continua. bmi270_read devuelve ESP_ERR_NOT_FINISHED mientras
-     *    no haya una muestra nueva; eso no es un error, solo hay que reintentar. */
-    bmi270_reading_t r;
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(CONTROL_PORT);
+    server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    if (server_addr.sin_addr.s_addr == IPADDR_NONE) {
+        ESP_LOGE(TAG, "SERVER_IP no es una direccion valida: %s", SERVER_IP);
+        return;
+    }
+
+    /* 4. Sesiones con el servidor. */
     while (1) {
-        ret = bmi270_read(&r);
-
-        /* bmi270_read ya imprime las tres líneas (m/s2, g y rad/s) por su
-         * cuenta, así que acá solo hay que reportar los fallos. */
-        if (ret != ESP_OK && ret != ESP_ERR_NOT_FINISHED) {
-            ESP_LOGW(TAG, "lectura falló: %s", esp_err_to_name(ret));
+        int control_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (control_sock < 0) {
+            ESP_LOGE(TAG, "No se pudo crear el socket de control (errno %d)", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+        ESP_LOGI(TAG, "Conectando al control en %s:%d...", SERVER_IP, CONTROL_PORT);
+        if (connect(control_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+            close(control_sock);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+        ESP_LOGI(TAG, "Conectado al servidor de control!");
+
+        bool had_session = handle_control(control_sock, &server_addr);
+        close(control_sock);
+        ESP_LOGI(TAG, "Desconectado del servidor de control");
+
+        if (had_session && ONE_SESSION_PER_BOOT) {
+            ESP_LOGI(TAG, "Sesion terminada. Presiona RESET para iniciar otra.");
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 }
-
