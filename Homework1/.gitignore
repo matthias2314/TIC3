@@ -56,6 +56,9 @@ __pycache__/
 *.egg-info/
 dist/
 
+# Sessions recorded with the fake ESP32 (esp_test.py); not part of the deliverable
+sensores_test/
+
 # Virtual environment folders
 venv/
 .venv/
