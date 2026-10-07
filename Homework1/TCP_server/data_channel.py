@@ -10,7 +10,7 @@ from protocol import (MSG_FMT, MSG_SIZE, U32_MASK, END_FMT, END_SIZE, END_CODE,
 UDP_BUFFER = 2048          # larger than any valid datagram, so bad sizes can be detected
 END_GRACE = 0.2            # seconds to wait for datagrams still in flight after END
 
-Sample = namedtuple('Sample', 'seq t_s rx_s dt_ms ax ay az ax_raw ay_raw az_raw')
+Sample = namedtuple('Sample', 'seq t_s rx_s dt_ms ax ay az ax_raw ay_raw az_raw late')
 
 
 class ClientClosed(ConnectionError):
@@ -42,8 +42,8 @@ class SampleTracker:
         self.duplicates = 0
 
     def process(self, seq, t_us, ax, ay, az):
-        """Check one message. Return a Sample, or None if it produces no data
-        (invalid, late or duplicate)."""
+        """Check one message. Return a Sample (with late=1 if it arrived out of
+        order), or None if it produces no data (invalid or duplicate)."""
         now = time.monotonic()                   # arrival time, RPi clock
 
         # --- Sequence check ---
@@ -56,9 +56,13 @@ class SampleTracker:
                 self.pending.remove(seq)
                 self.late += 1
                 print(f"WARNING: seq={seq} arrived late, not shown (counted as late, not lost)")
-            else:
-                self.duplicates += 1
-                print(f"WARNING: duplicate seq={seq}, ignored")
+                # It was taken BEFORE the newest sample: place it that far back in time.
+                # The tracker's timing state is not touched.
+                behind_us = (self.last_t - t_us) & U32_MASK
+                return self.build_sample(seq, self.elapsed_us - behind_us, now, None,
+                                         ax, ay, az, late=1)
+            self.duplicates += 1
+            print(f"WARNING: duplicate seq={seq}, ignored")
             return None
         if seq > self.next_seq:                  # ahead: something was skipped
             self.pending.update(range(self.next_seq, seq))
@@ -79,15 +83,19 @@ class SampleTracker:
         if self.first_rx is None:
             self.first_rx = now
 
-        # --- Conversion to m/s² ---
+        return self.build_sample(seq, self.elapsed_us, now, dt_ms, ax, ay, az, late=0)
+
+    def build_sample(self, seq, elapsed_us, now, dt_ms, ax, ay, az, late):
+        """Put one sample together, converting the raw values to m/s²."""
         s = self.scale
         return Sample(
             seq=seq,
-            t_s=self.elapsed_us / 1_000_000,
+            t_s=elapsed_us / 1_000_000,
             rx_s=now - self.first_rx,
             dt_ms=dt_ms,
             ax=ax * s, ay=ay * s, az=az * s,
             ax_raw=ax, ay_raw=ay, az_raw=az,
+            late=late,
         )
 
     def stats(self):
@@ -108,7 +116,9 @@ class SampleTracker:
 # Finishers: functions that receive the final stats when a session ends.
 # ---------------------------------------------------------------------------
 def print_sample(sample):
-    """Terminal consumer: print one line per sample."""
+    """Terminal consumer: print one line per sample, in order (late ones are skipped)."""
+    if sample.late:
+        return
     if sample.dt_ms is None:
         dt_text = "    ---"
     else:

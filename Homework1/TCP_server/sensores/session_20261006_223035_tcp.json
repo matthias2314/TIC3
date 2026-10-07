@@ -1,5 +1,5 @@
 {
-  "started": "2026-10-04T21:57:05",
+  "started": "2026-10-06T22:30:35",
   "config": {
     "range_g": 2,
     "rate_hz": 100.0,
@@ -7,7 +7,7 @@
     "mode": "sequential",
     "num_samples": 20
   },
-  "csv_file": "session_20261004_215705_tcp.csv",
+  "csv_file": "session_20261006_223035_tcp.csv",
   "stats": {
     "expected": 20,
     "received": 19,
