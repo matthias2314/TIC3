@@ -1,13 +1,15 @@
 {
-  "started": "2026-10-07T16:19:54",
+  "started": "2026-10-08T20:27:14",
   "config": {
     "range_g": 2,
     "rate_hz": 100.0,
     "transport": "tcp",
     "mode": "sequential",
-    "num_samples": 20
+    "stop": "samples",
+    "num_samples": 20,
+    "duration_s": null
   },
-  "csv_file": "session_20261007_161954_tcp.csv",
+  "csv_file": "session_20261008_202714_tcp.csv",
   "stats": {
     "expected": 20,
     "received": 20,
@@ -15,6 +17,7 @@
     "duplicates": 0,
     "missing": 0,
     "lost": 0,
-    "loss_pct": 0.0
+    "loss_pct": 0.0,
+    "stopped": false
   }
 }

@@ -1,0 +1,757 @@
+/* =====================================================================
+   Acquisition Monitor - style.css
+   Only appearance. Sections:
+     1. Variables (colours, sizes)    5. Plot panel
+     2. Base                          6. Bottom row
+     3. Layout                        7. STATES (classes JavaScript switches)
+     4. Header, panels, form
+   ===================================================================== */
+
+
+/* ---------------------------------------------------------------------
+   1. VARIABLES: change a colour here and it changes everywhere
+   --------------------------------------------------------------------- */
+:root {
+  /* Surfaces */
+  --bg:            #0a111d;   /* page background */
+  --panel:         #101a2a;   /* panels */
+  --panel-inner:   #0c1522;   /* boxes inside panels (cards, rows) */
+  --border:        #1f2d43;
+  --border-strong: #2c3d57;
+
+  /* Text */
+  --text:          #eef3fa;   /* main text and numbers: high contrast */
+  --text-label:    #b4c2d6;   /* labels: still easy to read */
+  --text-dim:      #7e8ea6;   /* only small, secondary hints */
+
+  /* Accent: selected buttons, Start */
+  --accent:        #38bdf8;
+  --accent-soft:   rgba(56, 189, 248, 0.14);
+  --accent-text:   #04121f;   /* text on a solid accent background */
+
+  /* The three axes: clearly different from each other and from the
+     status colours. a_y was purple in the mock-up (too close to blue). */
+  --axis-x:        #3d8bff;   /* blue   */
+  --axis-y:        #ff6fae;   /* pink   */
+  --axis-z:        #ff8a3d;   /* orange */
+
+  /* Status colours (never used for axes) */
+  --ok:            #22c55e;   /* connected, ready, no errors */
+  --warn:          #f59e0b;   /* waiting */
+  --error:         #f05252;   /* disconnected, error */
+  --finished:      #a3b8d3;   /* finished: neutral */
+
+  /* Sizes. Every font size is in rem: to make ALL text bigger,
+     change the font-size of html (section 2), one line. */
+  --radius:        10px;
+  --radius-sm:     7px;
+  --gap:           12px;
+  --pad:           14px;
+}
+
+
+/* ---------------------------------------------------------------------
+   2. BASE
+   --------------------------------------------------------------------- */
+html {
+  font-size: 16px;           /* 1rem. Change this to scale all the text */
+}
+
+* {
+  box-sizing: border-box;    /* width includes padding and border */
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  /* System fonts: nothing is downloaded from the internet */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+
+h1, h2, p, dl, dd, ul, fieldset {
+  margin: 0;
+  padding: 0;
+}
+
+fieldset { border: 0; min-width: 0; }
+ul       { list-style: none; }
+
+/* Numbers that change keep the same width, so they don't "jump" */
+.big-number, .stat-value, .card-value, .state-progress, .readout-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon--sm   { width: 1rem; height: 1rem; }
+.icon .fill { fill: currentColor; stroke: none; }
+
+.muted { color: var(--text-label); }
+.mono  { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; }
+
+
+/* ---------------------------------------------------------------------
+   3. LAYOUT: header on top, config | plot in the middle, 3 panels below.
+   The page fills the window (100vh) and fits 1280 x 720 without
+   scrolling; on a bigger window the plot grows.
+   --------------------------------------------------------------------- */
+.app {
+  height: 100vh;
+  min-height: 680px;
+  padding: var(--gap);
+  display: grid;
+  grid-template-columns: 23.5rem minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "header header"
+    "config plot"
+    "bottom bottom";
+  gap: var(--gap);
+}
+
+.header      { grid-area: header; }
+.config      { grid-area: config; }
+.plot-panel  { grid-area: plot; }
+.bottom      { grid-area: bottom; }
+
+
+/* ---------------------------------------------------------------------
+   4. HEADER, PANELS, FORM
+   --------------------------------------------------------------------- */
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 2px 4px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.brand-icon {
+  width: 2.25rem;
+  height: 2.25rem;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.brand-title {
+  font-size: 1.375rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.brand-subtitle {
+  color: var(--text-label);
+  font-size: 0.8125rem;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.875rem;
+}
+
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+/* Session state "pill", with a thin progress bar at the bottom */
+.state {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  min-width: 13rem;
+  padding: 9px 20px 11px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.state-label {
+  font-size: 0.9375rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.state-progress {
+  margin-left: auto;
+  font-size: 0.9375rem;
+  color: var(--text);
+}
+.state-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.06);
+}
+.state-bar-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: currentColor;
+  transition: width 0.2s linear;
+}
+
+/* Panels */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--pad);
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 1.0625rem;
+  font-weight: 650;
+}
+.panel-title .icon { color: var(--accent); }
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+/* Form */
+.config {
+  display: flex;
+  flex-direction: column;
+}
+.config-form {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 10px;
+  flex: 1;
+}
+
+.row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.label {
+  display: block;
+  padding: 0;
+  font-size: 0.8125rem;
+  color: var(--text-label);
+}
+.label--strong {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Selects and number fields */
+.input {
+  width: 100%;
+  height: 2.25rem;
+  padding: 0 12px;
+  background: var(--panel-inner);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+select.input {
+  appearance: none;
+  /* Small arrow drawn with two gradients (no image file needed) */
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-label) 50%),
+    linear-gradient(-45deg, transparent 50%, var(--text-label) 50%);
+  background-position: calc(100% - 17px) 52%, calc(100% - 12px) 52%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+/* Number field with its unit written inside, on the right */
+.input-unit {
+  position: relative;
+}
+.input-unit .input {
+  padding-right: 4.25rem;
+}
+.input-unit .unit {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-label);
+  font-size: 0.8125rem;
+  pointer-events: none;
+}
+
+/* Segmented toggle: radio inputs drawn as two joined buttons */
+.segmented {
+  display: flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel-inner);
+  padding: 3px;
+  gap: 3px;
+}
+.segmented input {
+  /* The round radio is hidden, but still works and can be focused */
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.segmented label {
+  flex: 1;
+  text-align: center;
+  padding: 6px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--text-label);
+  font-size: 0.875rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.segmented label:hover {
+  color: var(--text);
+}
+/* The chosen option: "a checked input, then its label" */
+.segmented input:checked + label {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.segmented input:focus-visible + label {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.segmented--small label {
+  padding: 4px 9px;
+  font-size: 0.75rem;
+}
+
+/* Sensitivity: text under the range, not a field */
+.readout {
+  font-size: 0.75rem;
+  color: var(--text-label);
+}
+.readout-value {
+  margin-left: 4px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.divider {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2px 0;
+}
+
+.acq-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.approx {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-left: 4px;
+}
+
+.hint {
+  margin-top: -3px;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  font-style: italic;
+}
+
+/* Buttons */
+.buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: auto;           /* pushed to the bottom of the panel */
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 2.625rem;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: filter 0.15s, background 0.15s;
+}
+.btn--start {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+.btn--stop {
+  background: rgba(240, 82, 82, 0.12);
+  border-color: var(--error);
+  color: #ff8d8d;
+}
+.btn:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.btn:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+/* While a session runs, app.js disables the form */
+.input:disabled,
+.segmented input:disabled + label {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.segmented input:disabled + label:hover {
+  color: var(--text-label);
+}
+
+
+/* ---------------------------------------------------------------------
+   5. PLOT PANEL
+   --------------------------------------------------------------------- */
+.plot-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.legend {
+  display: flex;
+  gap: 18px;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.875rem;
+}
+.legend-line {
+  width: 22px;
+  height: 3px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+/* The axis colour is set once per element; the dot or line inside
+   uses it through currentColor. The text stays white. */
+.axis-x .legend-line, .axis-x .dot { color: var(--axis-x); }
+.axis-y .legend-line, .axis-y .dot { color: var(--axis-y); }
+.axis-z .legend-line, .axis-z .dot { color: var(--axis-z); }
+
+/* Once app.js draws the chart, the canvas covers the whole box and
+   draws its own grid, so the background grid is removed */
+.plot.has-chart {
+  background-image: none;
+}
+.plot canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* The chart container. Its size comes from the layout: all the width of
+   the panel, and all the height left above the cards (never less than
+   12rem). The chart drawn by app.js just fills it. */
+.plot {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 12rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--panel-inner);
+  /* Faint grid, only as a background */
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 100% 12.5%, 10% 100%;
+  background-position: 0 -1px, -1px 0;
+}
+/* While the container is empty, show its placeholder text */
+.plot:empty::after {
+  content: attr(data-placeholder);
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 0.875rem;
+}
+
+/* Cards under the plot */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 14px;
+  background: var(--panel-inner);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.card-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-label);
+  font-size: 0.8125rem;
+}
+.card-label .icon { color: var(--text-label); }
+.card-value {
+  font-size: 1.5rem;
+  font-weight: 650;
+  line-height: 1.1;
+}
+.card-unit {
+  margin-left: 6px;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  color: var(--text-label);
+}
+
+
+/* ---------------------------------------------------------------------
+   6. BOTTOM ROW
+   --------------------------------------------------------------------- */
+.bottom {
+  display: grid;
+  grid-template-columns: 1.15fr 1.15fr 0.8fr;
+  gap: var(--gap);
+}
+.bottom .panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Label | value rows */
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.row {
+  display: grid;
+  grid-template-columns: 9.5rem 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--panel-inner);
+  border-radius: var(--radius-sm);
+}
+.row dt {
+  color: var(--text-label);
+  font-size: 0.8125rem;
+}
+.row dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rows--compact .row {
+  grid-template-columns: 2.75rem 1fr;
+  padding: 5px 12px;
+}
+
+/* Error row */
+.error-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ok);
+  font-weight: 600;
+}
+.error-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 800;
+}
+
+/* Summary: the six numbers in one row */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  background: var(--panel-inner);
+  border-radius: var(--radius-sm);
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 2px;
+}
+/* Lines between the cells */
+.stat + .stat { border-left: 1px solid var(--border); }
+.stat-label {
+  color: var(--text-label);
+  font-size: 0.75rem;
+}
+.stat-value {
+  font-size: 1.1875rem;
+  font-weight: 650;
+}
+
+/* Timing */
+.timing {
+  flex: 1;
+  justify-content: space-between;
+}
+.timing .row {
+  grid-template-columns: 1fr auto;
+  flex: 1;
+}
+.timing dd {
+  text-align: right;
+}
+.big-number {
+  font-size: 1.125rem;
+  font-weight: 650;
+}
+.unit {
+  color: var(--text-label);
+  font-size: 0.8125rem;
+}
+
+
+/* =====================================================================
+   7. STATES
+   JavaScript changes the look ONLY by adding or removing these classes
+   (and the disabled attribute on the buttons).
+   ===================================================================== */
+
+/* --- Header indicators: is-connected / is-disconnected --- */
+.indicator.is-connected .dot {
+  color: var(--ok);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
+}
+.indicator.is-disconnected .dot {
+  color: transparent;
+  border: 2px solid var(--error);
+}
+.indicator.is-disconnected {
+  color: #ffb4b4;
+}
+
+/* --- Session state: one class per state --- */
+.state--waiting  { color: var(--warn);     border-color: var(--warn);     background: rgba(245, 158, 11, 0.08); }
+.state--ready    { color: var(--ok);       border-color: var(--ok);       background: rgba(34, 197, 94, 0.08); }
+.state--running  { color: var(--accent);   border-color: var(--accent);   background: var(--accent-soft); }
+.state--finished { color: var(--finished); border-color: var(--finished); background: rgba(163, 184, 211, 0.08); }
+.state--error    { color: var(--error);    border-color: var(--error);    background: rgba(240, 82, 82, 0.10); }
+/* Only "running" shows the bar moving; finished leaves it full */
+.state--waiting .state-bar,
+.state--ready .state-bar,
+.state--error .state-bar { visibility: hidden; }
+
+/* --- Buttons: disabled --- */
+.btn:disabled {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* --- Samples / duration: the one that is only an estimate --- */
+.field.is-derived .input {
+  color: var(--text-label);
+  border-style: dashed;
+  background: transparent;
+}
+.field:not(.is-derived) .approx {
+  display: none;              /* "≈ approx." only on the estimated field */
+}
+
+/* --- Error row: (none) = no errors / is-error --- */
+.error-box.is-error {
+  color: var(--error);
+}
+
+/* --- Summary: is-empty = dashes, before the session ends --- */
+.summary.is-empty .stat-value {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+/* Note line when the session was stopped or interrupted */
+.note-warning {
+  color: var(--warn);
+  font-weight: 600;
+}

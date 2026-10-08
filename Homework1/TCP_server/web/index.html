@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Acquisition Monitor</title>
+  <!-- An empty tab icon, so the browser doesn't ask the server for favicon.ico -->
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+  <!-- defer: run app.js after the whole page has been read -->
+  <script src="app.js" defer></script>
+</head>
+
+<!--
+  Tarea 1 (TIC 3) - Acquisition Monitor.
+
+  This file only describes WHAT is on the page. How it looks is in style.css,
+  and what it does (buttons, live data) will be in app.js.
+
+  The page is shown here in its "running" state, with example values, so the
+  look can be checked against the mock-up. Every element that JavaScript will
+  change has an id, and every state has its own CSS class (see style.css,
+  section "STATES").
+-->
+<body>
+<div class="app">
+
+  <!-- ============================ HEADER ============================ -->
+  <header class="header">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M2 12h4l2.5-6 4 13 3-9 1.5 2H22"/>
+      </svg>
+      <div>
+        <h1 class="brand-title">Acquisition Monitor</h1>
+        <p class="brand-subtitle">Raspberry Pi · ESP32 Sensor System</p>
+      </div>
+    </div>
+
+    <!-- Connection state: the ONLY place where it is shown.
+         Classes: is-connected / is-disconnected -->
+    <div class="header-status">
+      <span id="ind-rpi" class="indicator is-connected">
+        <span class="dot" aria-hidden="true"></span>
+        <span>RPi <span id="ind-rpi-text">connected</span></span>
+      </span>
+      <span id="ind-esp" class="indicator is-connected">
+        <span class="dot" aria-hidden="true"></span>
+        <span>ESP32 <span id="ind-esp-text">connected</span></span>
+      </span>
+
+      <!-- Session state with its progress.
+           Classes: state--waiting / ready / running / finished / error -->
+      <div id="state" class="state state--running">
+        <span id="state-label" class="state-label">Running</span>
+        <span id="state-progress" class="state-progress">350 / 1000</span>
+        <span class="state-bar" aria-hidden="true">
+          <span id="state-bar-fill" class="state-bar-fill" style="width: 35%"></span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===================== CONFIGURATION (left) ===================== -->
+  <section class="panel config">
+    <h2 class="panel-title">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/>
+      </svg>
+      Configuration
+    </h2>
+
+    <form id="config-form" class="config-form">
+      <!-- Toggle buttons are radio inputs: only one can be chosen,
+           and the browser handles that without JavaScript. -->
+      <div class="row-2">
+        <fieldset class="field">
+          <legend class="label">Transport</legend>
+          <div class="segmented">
+            <input type="radio" id="transport-tcp" name="transport" value="tcp" checked>
+            <label for="transport-tcp">TCP</label>
+            <input type="radio" id="transport-udp" name="transport" value="udp">
+            <label for="transport-udp">UDP</label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend class="label">Read mode</legend>
+          <div class="segmented">
+            <input type="radio" id="mode-seq" name="mode" value="sequential" checked>
+            <label for="mode-seq">Sequential</label>
+            <input type="radio" id="mode-par" name="mode" value="parallel">
+            <label for="mode-par">Parallel</label>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="row-2">
+      <div class="field">
+        <label class="label" for="rate">Sample rate (Hz)</label>
+        <!-- The values are the same numbers server.py accepts in --rate -->
+        <select id="rate" name="rate" class="input">
+          <option value="12.5">12.5 Hz</option>
+          <option value="25">25 Hz</option>
+          <option value="50">50 Hz</option>
+          <option value="100" selected>100 Hz</option>
+          <option value="200">200 Hz</option>
+          <option value="400">400 Hz</option>
+          <option value="800">800 Hz</option>
+          <option value="1600">1600 Hz</option>
+        </select>
+      </div>
+
+        <div class="field">
+          <label class="label" for="range">Range (g)</label>
+          <select id="range" name="range" class="input">
+            <option value="2" selected>±2 g</option>
+            <option value="4">±4 g</option>
+            <option value="8">±8 g</option>
+            <option value="16">±16 g</option>
+          </select>
+          <!-- Read-only: it depends on the range, the user can't type it -->
+          <span class="readout">Sensitivity <span id="sensitivity" class="readout-value">0.061 mg/LSB</span></span>
+        </div>
+      </div>
+
+      <hr class="divider">
+
+      <div class="acq-head">
+        <span class="label label--strong">Acquisition</span>
+        <!-- Which value ends the session. The other one is only an estimate. -->
+        <div class="segmented segmented--small" role="radiogroup" aria-label="Stop by">
+          <input type="radio" id="stop-samples" name="stop" value="samples" checked>
+          <label for="stop-samples">Stop by samples</label>
+          <input type="radio" id="stop-time" name="stop" value="time">
+          <label for="stop-time">Stop by time</label>
+        </div>
+      </div>
+
+      <div class="row-2">
+        <!-- Class is-derived = this value is calculated from the other one -->
+        <div id="field-samples" class="field">
+          <label class="label" for="samples">Samples (N)</label>
+          <div class="input-unit">
+            <input id="samples" name="samples" class="input" type="number"
+                   min="1" step="1" value="1000">
+            <span class="unit">samples</span>
+          </div>
+        </div>
+        <div id="field-duration" class="field is-derived">
+          <label class="label" for="duration">Duration (T, s) <span class="approx">≈ approx.</span></label>
+          <div class="input-unit">
+            <input id="duration" name="duration" class="input" type="number"
+                   min="0.1" step="0.1" value="10.00">
+            <span class="unit">s</span>
+          </div>
+        </div>
+      </div>
+      <p class="hint">N = round(T × f<sub>s</sub>) · only the chosen one is sent to the ESP32</p>
+
+      <!-- The disabled attribute both greys a button out (style.css) and
+           makes it unclickable. Running view: Start off, Stop on. -->
+      <div class="buttons">
+        <button id="btn-start" type="submit" class="btn btn--start" disabled>
+          <svg class="icon icon--sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z" class="fill"/></svg>
+          Start
+        </button>
+        <button id="btn-stop" type="button" class="btn btn--stop">
+          <svg class="icon icon--sm" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" class="fill"/></svg>
+          Stop
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ========================= PLOT (right) ========================= -->
+  <section class="panel plot-panel">
+    <div class="panel-head">
+      <h2 class="panel-title">Acceleration (m/s²)</h2>
+      <ul class="legend" aria-label="Legend">
+        <li class="legend-item axis-x"><span class="legend-line"></span><span>a<sub>x</sub></span></li>
+        <li class="legend-item axis-y"><span class="legend-line"></span><span>a<sub>y</sub></span></li>
+        <li class="legend-item axis-z"><span class="legend-line"></span><span>a<sub>z</sub></span></li>
+      </ul>
+    </div>
+
+    <!-- Empty on purpose: app.js will draw the chart inside.
+         While it is empty, style.css shows the placeholder text. -->
+    <div id="plot" class="plot" data-placeholder="The chart will be drawn here"></div>
+
+    <!-- Latest values: shown only here (no separate panel) -->
+    <div class="cards">
+      <div class="card axis-x">
+        <span class="card-label"><span class="dot" aria-hidden="true"></span><span>a<sub>x</sub> latest</span></span>
+        <span class="card-value"><span id="val-ax">+0.42</span><span class="card-unit">m/s²</span></span>
+      </div>
+      <div class="card axis-y">
+        <span class="card-label"><span class="dot" aria-hidden="true"></span><span>a<sub>y</sub> latest</span></span>
+        <span class="card-value"><span id="val-ay">+0.03</span><span class="card-unit">m/s²</span></span>
+      </div>
+      <div class="card axis-z">
+        <span class="card-label"><span class="dot" aria-hidden="true"></span><span>a<sub>z</sub> latest</span></span>
+        <span class="card-value"><span id="val-az">+9.71</span><span class="card-unit">m/s²</span></span>
+      </div>
+      <div class="card">
+        <span class="card-label">
+          <svg class="icon icon--sm" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          Sample interval Δt
+        </span>
+        <span class="card-value"><span id="val-dt">10.02</span><span class="card-unit">ms</span></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================= BOTTOM ROW ========================== -->
+  <div class="bottom">
+
+    <!-- Status: running configuration and errors only -->
+    <section class="panel">
+      <h2 class="panel-title">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h4l2.5-6 4 13 3-9 1.5 2H22"/></svg>
+        Status
+      </h2>
+      <dl class="rows">
+        <div class="row">
+          <dt>Current configuration</dt>
+          <dd>
+            <span id="cfg-line1">TCP · Sequential · 100 Hz · ±2 g</span><br>
+            <span id="cfg-line2" class="muted">Stop by samples: N = 1000</span>
+          </dd>
+        </div>
+        <div class="row">
+          <dt>Error messages</dt>
+          <!-- Classes: (none) = no errors / is-error = something failed -->
+          <dd id="error-box" class="error-box">
+            <span class="error-icon" aria-hidden="true">✓</span>
+            <span id="error-text">No errors</span>
+          </dd>
+        </div>
+      </dl>
+    </section>
+
+    <!-- Summary. Class is-empty = session not finished yet (dashes) -->
+    <section class="panel">
+      <h2 class="panel-title">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>
+        Session Summary
+      </h2>
+      <div id="summary" class="summary is-empty">
+        <div class="stat"><span class="stat-label">Expected</span><span id="sum-expected" class="stat-value">—</span></div>
+        <div class="stat"><span class="stat-label">Received</span><span id="sum-received" class="stat-value">—</span></div>
+        <div class="stat"><span class="stat-label">Late</span><span id="sum-late" class="stat-value">—</span></div>
+        <div class="stat"><span class="stat-label">Duplicates</span><span id="sum-duplicates" class="stat-value">—</span></div>
+        <div class="stat"><span class="stat-label">Lost</span><span id="sum-lost" class="stat-value">—</span></div>
+        <div class="stat"><span class="stat-label">Loss</span><span class="stat-value"><span id="sum-loss">—</span> %</span></div>
+      </div>
+      <dl class="rows rows--compact">
+        <div class="row">
+          <dt>File</dt>
+          <dd id="sum-file" class="mono">sensores/session_20261008_143217_tcp.csv</dd>
+        </div>
+        <div class="row">
+          <dt>Note</dt>
+          <!-- e.g. "Stopped by user at 350 / 1000" -->
+          <dd id="sum-note">Session in progress…</dd>
+        </div>
+      </dl>
+    </section>
+
+    <!-- Timing: replaces the mock-up's "Latest Values" panel -->
+    <section class="panel">
+      <h2 class="panel-title">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        Timing
+      </h2>
+      <dl class="rows timing">
+        <div class="row">
+          <dt>Expected interval</dt>
+          <dd><span id="time-expected" class="big-number">10.00</span> <span class="unit">ms</span></dd>
+        </div>
+        <div class="row">
+          <dt>Mean interval</dt>
+          <dd><span id="time-mean" class="big-number">10.02</span> <span class="unit">ms</span></dd>
+        </div>
+        <div class="row">
+          <dt>Jitter</dt>
+          <dd><span id="time-jitter" class="big-number">0.31</span> <span class="unit">ms</span></dd>
+        </div>
+      </dl>
+    </section>
+
+  </div>
+</div>
+</body>
+</html>

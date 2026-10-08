@@ -5,7 +5,7 @@ import time
 from collections import namedtuple
 
 from protocol import (MSG_FMT, MSG_SIZE, U32_MASK, END_FMT, END_SIZE, END_CODE,
-                      scale_for)
+                      STOP_BY_COUNT, scale_for)
 
 UDP_BUFFER = 2048          # larger than any valid datagram, so bad sizes can be detected
 END_GRACE = 0.2            # seconds to wait for datagrams still in flight after END
@@ -31,7 +31,15 @@ def recv_exact(sock, n):
 class SampleTracker:
     def __init__(self, config):
         self.scale = scale_for(config.range_g)   # from THIS session's config
-        self.expected = config.num_samples
+        # How many samples the session should have. In count mode we know it
+        # from the start. In time mode we don't: it is set when the session
+        # ends (set_total), from END (UDP) or from the last seq seen (TCP).
+        if config.stop_mode == STOP_BY_COUNT:
+            self.expected = config.limit
+        else:
+            self.expected = None
+        self.reported_total = None   # samples the ESP32 says it took (END, UDP only)
+        self.stopped = False         # the session was ended early with STOP
         self.next_seq = 0            # every session starts at seq 0
         self.pending = set()         # skipped so far: lost, or still on their way
         self.last_t = None           # t_us of the previous sample
@@ -47,7 +55,7 @@ class SampleTracker:
         now = time.monotonic()                   # arrival time, RPi clock
 
         # --- Sequence check ---
-        if seq >= self.expected:
+        if self.expected is not None and seq >= self.expected:
             print(f"WARNING: seq={seq} is outside this session "
                   f"(0..{self.expected - 1}), ignored")
             return None
@@ -98,7 +106,23 @@ class SampleTracker:
             late=late,
         )
 
+    def set_total(self, total):
+        """END told us how many samples the ESP32 took. In time mode that is
+        the number to expect; in count mode we already knew it."""
+        self.reported_total = total
+        if self.expected is None:
+            self.expected = total
+
     def stats(self):
+        # Stopped early: only the samples the ESP32 took before STOP count,
+        # not the N that were planned. Without END (TCP) that's the last seq
+        # seen + 1; TCP doesn't lose data, so it is exact.
+        if self.stopped:
+            self.expected = (self.reported_total if self.reported_total is not None
+                             else self.next_seq)
+        # Time mode without END (TCP): same reasoning
+        if self.expected is None:
+            self.expected = self.next_seq
         lost = self.expected - self.received - self.late
         return {
             'expected': self.expected,
@@ -107,7 +131,8 @@ class SampleTracker:
             'duplicates': self.duplicates,
             'missing': len(self.pending),
             'lost': lost,
-            'loss_pct': 100 * lost / self.expected,
+            'loss_pct': 100 * lost / self.expected if self.expected else 0.0,
+            'stopped': self.stopped,
         }
 
 
@@ -135,6 +160,8 @@ def print_summary(stats):
     print(f"  late:       {stats['late']}")
     print(f"  duplicates: {stats['duplicates']}")
     print(f"  lost:       {stats['lost']} ({stats['loss_pct']:.1f} %)")
+    if stats['stopped']:
+        print("  (stopped early with STOP)")
 
 
 def handle_message(msg, tracker, consumers):
@@ -145,8 +172,9 @@ def handle_message(msg, tracker, consumers):
             consumer(sample)
 
 
-def finish_session(tracker, finishers):
+def finish_session(tracker, finishers, stop_event):
     """The session is over: give its final counters to every finisher."""
+    tracker.stopped = stop_event is not None and stop_event.is_set()
     stats = tracker.stats()
     for finish in finishers:
         finish(stats)
@@ -155,14 +183,17 @@ def finish_session(tracker, finishers):
 # ---------------------------------------------------------------------------
 # Receiving
 # ---------------------------------------------------------------------------
-def receive_samples_tcp(sock, config, consumers, finishers):
+# stop_event (optional): a threading.Event that is set when STOP was sent,
+# so the summary counts only the samples taken before it.
+
+def receive_samples_tcp(sock, config, consumers, finishers, stop_event=None):
     tracker = SampleTracker(config)
     try:
         while True:
             msg = recv_exact(sock, MSG_SIZE)
             handle_message(msg, tracker, consumers)
     finally:
-        finish_session(tracker, finishers)
+        finish_session(tracker, finishers, stop_event)
 
 
 def read_datagram(sock, esp_ip, tracker, consumers):
@@ -176,7 +207,8 @@ def read_datagram(sock, esp_ip, tracker, consumers):
         handle_message(msg, tracker, consumers)
 
 
-def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers):
+def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers,
+                        stop_event=None):
     tracker = SampleTracker(config)
     timeout = udp_sock.gettimeout()
     try:
@@ -193,11 +225,13 @@ def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers)
 
             # Only the control channel has something: it should be END
             try:
-                (code,) = struct.unpack(END_FMT, recv_exact(control, END_SIZE))
+                code, total = struct.unpack(END_FMT, recv_exact(control, END_SIZE))
             except ClientClosed:
                 raise ConnectionError("control channel closed before END")
             if code != END_CODE:
                 raise ConnectionError(f"unexpected control message 0x{code:02X}")
+            print(f"END: the ESP32 took {total} samples")
+            tracker.set_total(total)
 
             # END travels by TCP and can overtake the last datagrams: wait a
             # moment for any that are still on their way.
@@ -205,7 +239,7 @@ def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers)
                 read_datagram(udp_sock, esp_ip, tracker, consumers)
             return
     finally:
-        finish_session(tracker, finishers)
+        finish_session(tracker, finishers, stop_event)
 
 
 def drain_udp(sock):

@@ -1195,11 +1195,18 @@ esp_err_t bmi270_deinit(void) {
  * esp_test.py, pero con el sensor real:
  *
  *   1. CONTROL (TCP, puerto 10001): el ESP32 se conecta, recibe CONFIG
- *      (8 bytes), lo valida y responde un ACK (1 byte).
+ *      (9 bytes), lo valida y responde un ACK (1 byte).
  *   2. Programa el rango y la frecuencia pedidos en el acelerómetro.
- *   3. DATOS (TCP o UDP, puerto 10000): envía num_samples muestras de 14 bytes.
- *   4. FIN: con TCP, cerrar la conexión de datos. Con UDP, enviar END (0xFF)
- *      por el canal de control.
+ *   3. DATOS (TCP o UDP, puerto 10000): envía muestras de 14 bytes hasta
+ *      completar `limit` muestras (STOP_BY_COUNT) o hasta que pasen `limit`
+ *      milisegundos según su propio reloj (STOP_BY_TIME).
+ *   4. FIN: con TCP, cerrar la conexión de datos. Con UDP, enviar END (0xFF
+ *      y el total de muestras tomadas, 5 bytes) por el canal de control.
+ *   5. Vuelve a 1 por la MISMA conexión de control: espera el siguiente CONFIG.
+ *
+ * Durante la adquisición el servidor puede enviar STOP (0xFE, 1 byte) por el
+ * canal de control: el ESP32 lo revisa entre muestras y, si llega, termina la
+ * sesión igual que si hubiera llegado al límite (con END si es UDP).
  *
  * WIFI_SSID, WIFI_PASS y SERVER_IP están en main/secrets.h. */
 
@@ -1210,6 +1217,9 @@ esp_err_t bmi270_deinit(void) {
 #define TRANSPORT_UDP           1
 #define MODE_SEQUENTIAL         0
 #define MODE_PARALLEL           1
+#define STOP_BY_COUNT           0       // la sesión termina tras `limit` muestras
+#define STOP_BY_TIME            1       // la sesión termina tras `limit` milisegundos
+#define MAX_DURATION_MS         3600000 // 1 hora: la sesión por tiempo más larga que se acepta
 
 /* Códigos del ACK y de END: los mismos de protocol.py. */
 #define ACK_OK                  0
@@ -1218,16 +1228,17 @@ esp_err_t bmi270_deinit(void) {
 #define ERR_TRANSPORT           3
 #define ERR_MODE                4
 #define ERR_SAMPLES             5
+#define ERR_STOP                6
+#define ERR_DURATION            7
 #define END_CODE                0xFF
+#define STOP_CODE               0xFE    // servidor -> ESP32: terminar la sesión ya
 
 /* 1 = una sola sesión por encendido: al terminar, el ESP32 se queda quieto
  *     hasta que se presione RESET.
- * 0 = al terminar se reconecta solo y espera el siguiente CONFIG.
- *
- * Hoy server.py envía CONFIG apenas alguien se conecta, así que con 0 se
- * grabaría una sesión tras otra sin parar. Cambiar a 0 cuando el servidor
- * inicie las sesiones a pedido (desde la página web). */
-#define ONE_SESSION_PER_BOOT    1
+ * 0 = al terminar sigue conectado y espera el siguiente CONFIG. Es lo que
+ *     necesita la página web (web_server.py), que envía CONFIG solo cuando se
+ *     presiona Start. server.py también funciona: hace una sesión y se cierra. */
+#define ONE_SESSION_PER_BOOT    0
 
 #define RECONNECT_DELAY_MS      2000    // espera antes de reintentar la conexión de control
 #define NO_DATA_TIMEOUT_US      2000000 // si el sensor no entrega nada en 2 s, se corta la sesión
@@ -1241,8 +1252,9 @@ typedef struct __attribute__((packed)) {
     uint8_t  odr_code;      // código de registro del BMI270: 0x05 (12.5 Hz) ... 0x0C (1600 Hz)
     uint8_t  transport;     // TRANSPORT_TCP o TRANSPORT_UDP
     uint8_t  read_mode;     // MODE_SEQUENTIAL o MODE_PARALLEL
-    uint32_t num_samples;   // muestras de la sesión
-} control_config_t;         // '<BBBBI' en protocol.py
+    uint8_t  stop_mode;     // STOP_BY_COUNT o STOP_BY_TIME: qué significa `limit`
+    uint32_t limit;         // muestras (por cantidad) o milisegundos (por tiempo)
+} control_config_t;         // '<BBBBBI' en protocol.py
 
 typedef struct __attribute__((packed)) {
     uint32_t seq;           // número de muestra; parte en 0 en cada sesión
@@ -1252,8 +1264,14 @@ typedef struct __attribute__((packed)) {
     int16_t  az;
 } data_msg_t;               // '<IIhhh' en protocol.py
 
-_Static_assert(sizeof(control_config_t) == 8,  "CONFIG debe medir 8 bytes");
+typedef struct __attribute__((packed)) {
+    uint8_t  code;          // END_CODE
+    uint32_t total;         // muestras tomadas: seq de 0 a total-1
+} end_msg_t;                // '<BI' en protocol.py
+
+_Static_assert(sizeof(control_config_t) == 9,  "CONFIG debe medir 9 bytes");
 _Static_assert(sizeof(data_msg_t) == 14,       "la muestra debe medir 14 bytes");
+_Static_assert(sizeof(end_msg_t) == 5,         "END debe medir 5 bytes");
 
 
 /* ------------------------------- WiFi -------------------------------- */
@@ -1355,6 +1373,34 @@ static bool send_sample(int data_sock, uint8_t transport, const struct sockaddr_
     return true;
 }
 
+/* ¿Pidió el servidor terminar la sesión? Mira el canal de control SIN esperar
+ * (MSG_DONTWAIT): si no llegó nada, recv() falla con EAGAIN y se sigue normal.
+ * También se termina si el servidor cerró el control o la conexión se cayó. */
+static bool stop_requested(int control_sock) {
+    uint8_t b;
+    int r = recv(control_sock, &b, 1, MSG_DONTWAIT);
+    if (r == 1) {
+        return b == STOP_CODE;              // otro byte: se ignora
+    }
+    if (r == 0) {
+        return true;                        // el servidor cerró la conexión
+    }
+    return errno != EAGAIN && errno != EWOULDBLOCK;
+}
+
+/* Recibe un CONFIG. Un STOP que llegó tarde (cuando la sesión ya había
+ * terminado sola) quedó esperando en el socket: se descarta. No se confunde
+ * con un CONFIG porque su primer byte es el rango (2, 4, 8 o 16), nunca 0xFE. */
+static bool recv_config(int control_sock, control_config_t *cfg) {
+    uint8_t *p = (uint8_t *)cfg;
+    do {
+        if (!recv_exact(control_sock, p, 1)) {
+            return false;
+        }
+    } while (p[0] == STOP_CODE);
+    return recv_exact(control_sock, p + 1, sizeof(*cfg) - 1);
+}
+
 
 /* ----------------------------- Sensor -------------------------------- */
 
@@ -1442,10 +1488,33 @@ static uint8_t validate_config(const control_config_t *cfg, int *odr_macro) {
     if (cfg->read_mode != MODE_SEQUENTIAL && cfg->read_mode != MODE_PARALLEL) {
         return ERR_MODE;
     }
-    if (cfg->num_samples == 0) {
-        return ERR_SAMPLES;
+    if (cfg->stop_mode == STOP_BY_COUNT) {
+        if (cfg->limit == 0) {
+            return ERR_SAMPLES;
+        }
+    } else if (cfg->stop_mode == STOP_BY_TIME) {
+        if (cfg->limit == 0 || cfg->limit > MAX_DURATION_MS) {
+            return ERR_DURATION;
+        }
+    } else {
+        return ERR_STOP;
     }
     return ACK_OK;
+}
+
+/* Momento en que empezó la adquisición (esp_timer_get_time, en µs). Lo fija
+ * run_acquisition justo antes de leer la primera muestra. */
+static int64_t s_session_start_us = 0;
+
+/* ¿Hay que tomar otra muestra? `seq` es cuántas se han tomado hasta ahora.
+ * Por cantidad: mientras falten muestras. Por tiempo: mientras no hayan pasado
+ * `limit` ms desde el inicio. Se revisa ANTES de esperar cada muestra, así que
+ * la última puede llegar hasta un periodo después del límite (10 ms a 100 Hz). */
+static bool session_running(const control_config_t *cfg, uint32_t seq) {
+    if (cfg->stop_mode == STOP_BY_COUNT) {
+        return seq < cfg->limit;
+    }
+    return esp_timer_get_time() - s_session_start_us < (int64_t)cfg->limit * 1000;
 }
 
 /* Programa en el acelerómetro el rango y la frecuencia de la sesión. El sensor
@@ -1478,12 +1547,14 @@ static SemaphoreHandle_t s_reader_done = NULL;  // read_task lo entrega justo an
 static volatile bool s_stop_reader = false;     // la tarea principal pide a read_task que pare
 static volatile bool s_reader_failed = false;   // el sensor falló en read_task
 static volatile uint32_t s_dropped = 0;         // muestras descartadas por cola llena
+static volatile uint32_t s_taken = 0;           // muestras que read_task leyó (seq final)
+static bool s_stopped = false;                  // la sesión terminó por un STOP del servidor
 
 static void parallel_read_task(void *arg) {
     const control_config_t *cfg = (const control_config_t *)arg;
     uint32_t seq = 0;
 
-    while (seq < cfg->num_samples && !s_stop_reader) {
+    while (session_running(cfg, seq) && !s_stop_reader) {
         data_msg_t msg;
         esp_err_t err = wait_sample(seq, &msg);
         if (err != ESP_OK) {
@@ -1492,6 +1563,7 @@ static void parallel_read_task(void *arg) {
             break;
         }
         seq++;
+        s_taken = seq;
 
         /* Sin espera: si la cola está llena, la muestra se descarta. Como seq
          * ya avanzó, el servidor verá el hueco y lo contará como pérdida.
@@ -1505,17 +1577,19 @@ static void parallel_read_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-/* Lado emisor del modo paralelo. Devuelve cuántas muestras envió y deja en
- * *ok si la sesión terminó bien. */
-static uint32_t run_parallel(int data_sock, const control_config_t *cfg,
-                             const struct sockaddr_in *dest, bool *ok) {
-    uint32_t sent = 0;
+/* Lado emisor del modo paralelo. Devuelve cuántas muestras se tomaron (el
+ * seq final, incluidas las descartadas por cola llena), deja en *sent cuántas
+ * se enviaron y en *ok si la sesión terminó bien. */
+static uint32_t run_parallel(int data_sock, int control_sock, const control_config_t *cfg,
+                             const struct sockaddr_in *dest, uint32_t *sent, bool *ok) {
+    *sent = 0;
 
     s_data_queue = xQueueCreate(PARALLEL_QUEUE_LEN, sizeof(data_msg_t));
     s_reader_done = xSemaphoreCreateBinary();
     s_stop_reader = false;
     s_reader_failed = false;
     s_dropped = 0;
+    s_taken = 0;
 
     if (s_data_queue == NULL || s_reader_done == NULL ||
         xTaskCreatePinnedToCore(parallel_read_task, "read_task", 4096, (void *)cfg, 5, NULL, 1) != pdPASS) {
@@ -1528,6 +1602,13 @@ static uint32_t run_parallel(int data_sock, const control_config_t *cfg,
 
     bool reader_finished = false;
     while (true) {
+        /* STOP: se le pide a read_task que pare. Lo que ya está en la cola
+         * se envía igual, y el bucle termina cuando read_task avisa. */
+        if (!s_stop_reader && stop_requested(control_sock)) {
+            s_stopped = true;
+            s_stop_reader = true;
+        }
+
         data_msg_t msg;
         TickType_t wait = reader_finished ? 0 : pdMS_TO_TICKS(50);
         if (xQueueReceive(s_data_queue, &msg, wait) == pdTRUE) {
@@ -1536,7 +1617,7 @@ static uint32_t run_parallel(int data_sock, const control_config_t *cfg,
                 *ok = false;
                 break;
             }
-            sent++;
+            (*sent)++;
             continue;
         }
         if (reader_finished) {
@@ -1563,19 +1644,26 @@ static uint32_t run_parallel(int data_sock, const control_config_t *cfg,
     if (s_dropped > 0) {
         ESP_LOGW(TAG, "Cola llena: %lu muestras descartadas", (unsigned long)s_dropped);
     }
-    return sent;
+    return s_taken;
 }
 
 
 /* --------------------------- Modo secuencial ------------------------- */
 
 /* Una sola tarea lee y envía, una cosa después de la otra. Si un envío se
- * demora, la siguiente lectura se atrasa. */
-static uint32_t run_sequential(int data_sock, const control_config_t *cfg,
-                               const struct sockaddr_in *dest, bool *ok) {
+ * demora, la siguiente lectura se atrasa. Devuelve cuántas muestras se
+ * tomaron y deja en *sent cuántas se enviaron. */
+static uint32_t run_sequential(int data_sock, int control_sock, const control_config_t *cfg,
+                               const struct sockaddr_in *dest, uint32_t *sent, bool *ok) {
     uint32_t seq = 0;
+    *sent = 0;
 
-    while (seq < cfg->num_samples) {
+    while (session_running(cfg, seq)) {
+        if (stop_requested(control_sock)) {
+            s_stopped = true;
+            break;
+        }
+
         data_msg_t msg;
         esp_err_t err = wait_sample(seq, &msg);
         if (err != ESP_OK) {
@@ -1590,6 +1678,7 @@ static uint32_t run_sequential(int data_sock, const control_config_t *cfg,
             *ok = false;
             break;
         }
+        (*sent)++;
     }
     return seq;
 }
@@ -1621,22 +1710,27 @@ static void run_acquisition(int control_sock, const control_config_t *cfg,
     }
 
     bool ok = true;
-    uint32_t sent;
+    uint32_t taken, sent;
     s_udp_send_errors = 0;
+    s_stopped = false;
+    s_session_start_us = esp_timer_get_time();     // aquí empieza a correr el tiempo
 
     if (cfg->read_mode == MODE_SEQUENTIAL) {
-        sent = run_sequential(data_sock, cfg, &dest, &ok);
+        taken = run_sequential(data_sock, control_sock, cfg, &dest, &sent, &ok);
     } else {
-        sent = run_parallel(data_sock, cfg, &dest, &ok);
+        taken = run_parallel(data_sock, control_sock, cfg, &dest, &sent, &ok);
     }
+    double seconds = (esp_timer_get_time() - s_session_start_us) / 1e6;
 
     /* Fin de la sesión. Con UDP no existe "cerrar", así que se avisa con END
      * por el canal de control, que es TCP y no se pierde. Se envía aunque la
      * sesión haya terminado mal, para que el servidor no se quede esperando.
+     * Lleva el total de muestras tomadas: en el modo por tiempo es la única
+     * forma de que el servidor sepa cuántas esperar (y cuántas se perdieron).
      * Con TCP, cerrar la conexión de datos ya es el aviso. */
     if (cfg->transport == TRANSPORT_UDP) {
-        uint8_t end_msg = END_CODE;
-        if (!send_all(control_sock, &end_msg, 1)) {
+        end_msg_t end_msg = { .code = END_CODE, .total = taken };
+        if (!send_all(control_sock, &end_msg, sizeof(end_msg))) {
             ESP_LOGW(TAG, "No se pudo enviar END por el canal de control");
         }
     }
@@ -1645,40 +1739,59 @@ static void run_acquisition(int control_sock, const control_config_t *cfg,
     if (s_udp_send_errors > 0) {
         ESP_LOGW(TAG, "%lu datagramas UDP no se pudieron enviar", (unsigned long)s_udp_send_errors);
     }
-    ESP_LOGI(TAG, "Adquisicion %s: %lu de %lu muestras enviadas",
-             ok ? "finalizada" : "INTERRUMPIDA",
-             (unsigned long)sent, (unsigned long)cfg->num_samples);
+    const char *result = !ok ? "INTERRUMPIDA" : (s_stopped ? "DETENIDA por el servidor" : "finalizada");
+    if (cfg->stop_mode == STOP_BY_COUNT) {
+        ESP_LOGI(TAG, "Adquisicion %s: %lu de %lu muestras enviadas (%.2f s)",
+                 result,
+                 (unsigned long)sent, (unsigned long)cfg->limit, seconds);
+    } else {
+        ESP_LOGI(TAG, "Adquisicion %s: %lu muestras tomadas, %lu enviadas, en %.2f de %.2f s",
+                 result,
+                 (unsigned long)taken, (unsigned long)sent, seconds, cfg->limit / 1000.0);
+    }
 }
 
-/* Atiende una conexión de control: recibe CONFIG, responde el ACK y, si el
- * CONFIG es válido, corre la adquisición. Devuelve true si hubo adquisición. */
+/* Atiende una conexión de control: por cada CONFIG que llega responde el ACK
+ * y, si es válido, corre la adquisición. Después espera el siguiente CONFIG
+ * por la misma conexión, hasta que el servidor la cierre.
+ * Devuelve true si hubo al menos una adquisición. */
 static bool handle_control(int control_sock, const struct sockaddr_in *server_addr) {
-    control_config_t cfg;
-    if (!recv_exact(control_sock, &cfg, sizeof(cfg))) {
-        ESP_LOGW(TAG, "El servidor cerro el control sin enviar CONFIG");
-        return false;
-    }
+    bool had_session = false;
 
-    int odr_macro = 0;
-    uint8_t ack = validate_config(&cfg, &odr_macro);
-    if (!send_all(control_sock, &ack, 1)) {
-        ESP_LOGE(TAG, "No se pudo enviar el ACK");
-        return false;
-    }
-    if (ack != ACK_OK) {
-        ESP_LOGW(TAG, "Configuracion rechazada. ACK=%d", ack);
-        return false;
-    }
+    while (true) {
+        control_config_t cfg;
+        if (!recv_config(control_sock, &cfg)) {
+            ESP_LOGI(TAG, "El servidor cerro el canal de control");
+            return had_session;
+        }
 
-    ESP_LOGI(TAG, "Config OK: range=%d, odr=0x%02x, trans=%d, mode=%d, samples=%lu",
-             cfg.range_g, cfg.odr_code, cfg.transport, cfg.read_mode, (unsigned long)cfg.num_samples);
+        int odr_macro = 0;
+        uint8_t ack = validate_config(&cfg, &odr_macro);
+        if (!send_all(control_sock, &ack, 1)) {
+            ESP_LOGE(TAG, "No se pudo enviar el ACK");
+            return had_session;
+        }
+        if (ack != ACK_OK) {
+            ESP_LOGW(TAG, "Configuracion rechazada. ACK=%d", ack);
+            continue;               // se espera otro CONFIG
+        }
 
-    if (!apply_sensor_config(&cfg, odr_macro)) {
-        return false;
+        ESP_LOGI(TAG, "Config OK: range=%d, odr=0x%02x, trans=%d, mode=%d, %s=%lu",
+                 cfg.range_g, cfg.odr_code, cfg.transport, cfg.read_mode,
+                 cfg.stop_mode == STOP_BY_COUNT ? "samples" : "ms", (unsigned long)cfg.limit);
+
+        if (!apply_sensor_config(&cfg, odr_macro)) {
+            return had_session;
+        }
+
+        run_acquisition(control_sock, &cfg, server_addr);
+        had_session = true;
+
+        if (ONE_SESSION_PER_BOOT) {
+            return true;
+        }
+        ESP_LOGI(TAG, "Esperando la siguiente configuracion...");
     }
-
-    run_acquisition(control_sock, &cfg, server_addr);
-    return true;
 }
 
 
