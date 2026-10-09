@@ -83,12 +83,20 @@ STATUS_TEXT = {
     ERR_DURATION: "invalid duration",
 }
 
-# END (ESP32 -> RPi, control channel, UDP sessions only): 0xFF and how many
-# samples the ESP32 took (seq 0 .. total-1). In time mode it is the only way
-# the server learns how many samples to expect, and so how many were lost.
-END_FMT = '<BI'
-END_SIZE = struct.calcsize(END_FMT)        # 5 bytes
+# END (ESP32 -> RPi, control channel, at the end of EVERY session, TCP or UDP):
+#   code    0xFF
+#   result  how the session ended (END_COMPLETED, END_STOPPED, END_FAILED)
+#   total   samples the ESP32 took (seq 0 .. total-1). In time mode it is the
+#           only way the server learns how many to expect, and so how many
+#           were lost.
+# No END at all means the session was interrupted (the ESP32 disconnected).
+END_FMT = '<BBI'
+END_SIZE = struct.calcsize(END_FMT)        # 6 bytes
 END_CODE = 0xFF
+END_COMPLETED = 0                          # reached N samples or T seconds
+END_STOPPED = 1                            # the server sent STOP
+END_FAILED = 2                             # the sensor or the sending failed on the ESP32
+END_RESULT = {END_COMPLETED: 'completed', END_STOPPED: 'stopped', END_FAILED: 'failed'}
 
 # STOP (RPi -> ESP32, control channel, during a session): end the session now.
 # The ESP32 then finishes exactly as if it had reached its limit (END for UDP,

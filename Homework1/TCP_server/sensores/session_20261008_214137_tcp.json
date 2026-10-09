@@ -1,0 +1,23 @@
+{
+  "started": "2026-10-08T21:41:37",
+  "config": {
+    "range_g": 2,
+    "rate_hz": 200.0,
+    "transport": "tcp",
+    "mode": "sequential",
+    "stop": "time",
+    "num_samples": null,
+    "duration_s": 10.0
+  },
+  "csv_file": "session_20261008_214137_tcp.csv",
+  "stats": {
+    "expected": 2023,
+    "received": 2023,
+    "late": 0,
+    "duplicates": 0,
+    "missing": 0,
+    "lost": 0,
+    "loss_pct": 0.0,
+    "result": "completed"
+  }
+}

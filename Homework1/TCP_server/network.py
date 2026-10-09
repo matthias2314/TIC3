@@ -1,4 +1,4 @@
-"""Network settings and sockets shared by the servers (web_server.py and server.py)."""
+"""Network settings and the server sockets (used by web_server.py)."""
 import socket
 
 HOST = '0.0.0.0'          # all interfaces

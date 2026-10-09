@@ -108,14 +108,17 @@ function updateSensitivity() {
 }
 
 /** The field that is NOT chosen in "Stop by" is calculated from the other:
-    N = round(T × rate)  or  T = N / rate. It's only an estimate. */
+    N = round(T × rate)  or  T = N / rate. It's only an estimate.
+    If the chosen field is empty or not a number, the other one is left empty. */
 function updateDerived() {
   const rate = Number(ui.rate.value);
   const byTime = selectedRadio("stop") === "time";
   if (byTime) {
-    ui.samples.value = Math.round(Number(ui.duration.value) * rate);
+    const seconds = readNumber(ui.duration);
+    ui.samples.value = Number.isFinite(seconds) ? Math.round(seconds * rate) : "";
   } else {
-    ui.duration.value = (Number(ui.samples.value) / rate).toFixed(2);
+    const samples = readNumber(ui.samples);
+    ui.duration.value = Number.isFinite(samples) ? (samples / rate).toFixed(2) : "";
   }
   ui.fieldSamples.classList.toggle("is-derived", byTime);
   ui.fieldDuration.classList.toggle("is-derived", !byTime);
@@ -132,6 +135,41 @@ function updateExpectedInterval() {
 function chooseStop(value) {
   ui.form.querySelector(`input[name="stop"][value="${value}"]`).checked = true;
   updateDerived();
+}
+
+/** The number typed in a field, or NaN if it's empty or not a number.
+    (Number("") would be 0, which would hide an empty field.) */
+function readNumber(input) {
+  return input.value.trim() === "" ? NaN : Number(input.value);
+}
+
+const MAX_SECONDS = 3600;          // the ESP32 accepts sessions of up to 1 hour
+
+/** Check the field that ends the session. Returns a message for the user,
+    or null if everything is fine. Only the chosen field is checked: the
+    other one is just an estimate and is not sent to the ESP32. */
+function formProblem() {
+  if (selectedRadio("stop") === "time") {
+    const seconds = readNumber(ui.duration);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return "Duration (T) must be a number of seconds greater than 0";
+    }
+    if (seconds > MAX_SECONDS) {
+      return `Duration (T) can be at most ${MAX_SECONDS} s (1 hour)`;
+    }
+    if (Math.round(seconds * 1000) < 1) {
+      return "Duration (T) must be at least 0.001 s";
+    }
+  } else {
+    const samples = readNumber(ui.samples);
+    if (!Number.isInteger(samples) || samples < 1) {
+      return "Samples (N) must be a whole number, 1 or more";
+    }
+    if (samples > 4294967295) {
+      return "Samples (N) is too large";
+    }
+  }
+  return null;
 }
 
 /** Everything the server needs for /start (web_server.py: config_from_form) */
@@ -184,6 +222,11 @@ async function post(path, body) {
 // Start is the form's submit button: pressing it (or Enter) submits the form
 ui.form.addEventListener("submit", async (event) => {
   event.preventDefault();              // don't reload the page (the browser's default)
+  const problem = formProblem();
+  if (problem) {                       // say what's wrong instead of sending it
+    showError(problem);
+    return;
+  }
   page.busy = true;
   updateButtons();
   try {
@@ -351,15 +394,16 @@ function showSummary(stats) {
   if (stats) {
     ui.sumFile.textContent = stats.file;
     ui.sumNote.textContent = stats.note;
-    // A session that didn't end by itself gets the warning colour
-    ui.sumNote.classList.toggle("note-warning", stats.stopped || stats.interrupted);
+    // A session that didn't complete gets the warning colour
+    // (result: completed | stopped | failed | interrupted, see data_channel.py)
+    ui.sumNote.classList.toggle("note-warning", stats.result !== "completed");
   } else {
     ui.sumNote.classList.remove("note-warning");
   }
 }
 
-/** Option 2: the HTML has example values to check the look; replace them
-    with the real "nothing yet" state as soon as the page loads. */
+/** index.html contains example values, so its look can be checked without
+    a server. Replace them with the real "nothing yet" state on load. */
 function resetPage() {
   for (const value of [ui.valAx, ui.valAy, ui.valAz, ui.valDt, ui.timeMean, ui.timeJitter]) {
     value.textContent = DASH;

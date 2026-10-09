@@ -48,7 +48,9 @@
  *   - Al final hay una sección nueva, "RED Y ADQUISICIÓN": WiFi, canal de
  *     control, canal de datos (TCP o UDP) y los modos secuencial y paralelo.
  *   - app_main ya no imprime muestras por el monitor serie: se conecta al
- *     servidor (server.py), recibe la configuración y envía las muestras.
+ *     servidor (web_server.py), recibe la configuración y envía las muestras.
+ *   - Las muestras se leen de la FIFO del BMI270 (en ráfagas), no de a una:
+ *     es lo que permite llegar a 1600 Hz. Ver fifo_take().
  *   - SAMPLE_PERIOD_MS y bmi270_read() ya no se usan. Quedan como referencia.
  *
  * Por eso dos cosas del encabezado original ya no valen para este proyecto:
@@ -58,7 +60,7 @@
  *
  * ANTES DE COMPILAR
  *     Copiar main/secrets.h.example a main/secrets.h y poner ahí el nombre y
- *     la clave del WiFi y la IP del computador que corre server.py.
+ *     la clave del WiFi y la IP del computador que corre web_server.py.
  *
  * AJUSTES DEL PROYECTO (están en sdkconfig.defaults)
  *     CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384   la carga del config_file del
@@ -99,7 +101,9 @@
 /* Lo único que hay que cambiar para otra placa. */
 #define I2C_MASTER_SCL_IO       GPIO_NUM_2      // reloj
 #define I2C_MASTER_SDA_IO       GPIO_NUM_42     // datos
-#define I2C_MASTER_FREQ_HZ      100000
+#define I2C_MASTER_FREQ_HZ      400000  // Tarea 1: era 100000. A 1600 Hz la FIFO entrega
+                                        // ~11 KB/s, todo lo que cabe en un bus de 100 kHz.
+                                        // El BMI270 admite 400 kHz (fast mode).
 
 /* Cada cuánto se imprime una muestra. */
 #define SAMPLE_PERIOD_MS        200
@@ -1191,7 +1195,7 @@ esp_err_t bmi270_deinit(void) {
 /*****************************************************************/
 
 /* Todo lo que sigue se agregó al driver original para hablar con el servidor
- * (server.py). Es el mismo protocolo de protocol.py, y hace lo mismo que
+ * (web_server.py). Es el mismo protocolo de protocol.py, y hace lo mismo que
  * esp_test.py, pero con el sensor real:
  *
  *   1. CONTROL (TCP, puerto 10001): el ESP32 se conecta, recibe CONFIG
@@ -1200,13 +1204,14 @@ esp_err_t bmi270_deinit(void) {
  *   3. DATOS (TCP o UDP, puerto 10000): envía muestras de 14 bytes hasta
  *      completar `limit` muestras (STOP_BY_COUNT) o hasta que pasen `limit`
  *      milisegundos según su propio reloj (STOP_BY_TIME).
- *   4. FIN: con TCP, cerrar la conexión de datos. Con UDP, enviar END (0xFF
- *      y el total de muestras tomadas, 5 bytes) por el canal de control.
+ *   4. FIN: envía END por el canal de control (6 bytes: 0xFF, cómo terminó
+ *      la sesión y el total de muestras tomadas). Con TCP además se cierra la
+ *      conexión de datos.
  *   5. Vuelve a 1 por la MISMA conexión de control: espera el siguiente CONFIG.
  *
  * Durante la adquisición el servidor puede enviar STOP (0xFE, 1 byte) por el
  * canal de control: el ESP32 lo revisa entre muestras y, si llega, termina la
- * sesión igual que si hubiera llegado al límite (con END si es UDP).
+ * sesión igual que si hubiera llegado al límite, con END_STOPPED en el END.
  *
  * WIFI_SSID, WIFI_PASS y SERVER_IP están en main/secrets.h. */
 
@@ -1231,18 +1236,23 @@ esp_err_t bmi270_deinit(void) {
 #define ERR_STOP                6
 #define ERR_DURATION            7
 #define END_CODE                0xFF
+/* Cómo terminó la sesión: segundo byte de END */
+#define END_COMPLETED           0       // llegó a N muestras o a T segundos
+#define END_STOPPED             1       // el servidor envió STOP
+#define END_FAILED              2       // falló el sensor o el envío de datos
 #define STOP_CODE               0xFE    // servidor -> ESP32: terminar la sesión ya
 
 /* 1 = una sola sesión por encendido: al terminar, el ESP32 se queda quieto
  *     hasta que se presione RESET.
  * 0 = al terminar sigue conectado y espera el siguiente CONFIG. Es lo que
  *     necesita la página web (web_server.py), que envía CONFIG solo cuando se
- *     presiona Start. server.py también funciona: hace una sesión y se cierra. */
+ *     presiona Start. */
 #define ONE_SESSION_PER_BOOT    0
 
 #define RECONNECT_DELAY_MS      2000    // espera antes de reintentar la conexión de control
 #define NO_DATA_TIMEOUT_US      2000000 // si el sensor no entrega nada en 2 s, se corta la sesión
-#define PARALLEL_QUEUE_LEN      100     // muestras que caben en la cola del modo paralelo
+#define PARALLEL_QUEUE_LEN      512     // muestras que caben en la cola del modo paralelo
+#define FIFO_POLL_MS            5       // cada cuánto se vacía la FIFO del sensor
 
 /* Los dos mensajes binarios. `packed` evita que el compilador agregue relleno:
  * sin él, la muestra mediría 16 bytes en vez de 14 y el servidor leería basura.
@@ -1266,12 +1276,13 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint8_t  code;          // END_CODE
+    uint8_t  result;        // END_COMPLETED, END_STOPPED o END_FAILED
     uint32_t total;         // muestras tomadas: seq de 0 a total-1
-} end_msg_t;                // '<BI' en protocol.py
+} end_msg_t;                // '<BBI' en protocol.py
 
 _Static_assert(sizeof(control_config_t) == 9,  "CONFIG debe medir 9 bytes");
 _Static_assert(sizeof(data_msg_t) == 14,       "la muestra debe medir 14 bytes");
-_Static_assert(sizeof(end_msg_t) == 5,         "END debe medir 5 bytes");
+_Static_assert(sizeof(end_msg_t) == 6,         "END debe medir 6 bytes");
 
 
 /* ------------------------------- WiFi -------------------------------- */
@@ -1404,63 +1415,230 @@ static bool recv_config(int control_sock, control_config_t *cfg) {
 
 /* ----------------------------- Sensor -------------------------------- */
 
-/* Lee una muestra CRUDA del acelerómetro: tres int16, sin convertir ni
- * imprimir (la conversión a m/s^2 la hace el servidor, con el rango de la
- * sesión). Son los mismos pasos que la primera mitad de bmi270_read().
+/* Las muestras se leen de la FIFO del BMI270: una memoria de 2048 bytes
+ * dentro del sensor donde él mismo va guardando cada muestra, a su ritmo.
+ * El ESP32 la vacía cada FIFO_POLL_MS y lee muchas muestras en una sola
+ * transferencia I2C, en vez de preguntar "¿hay muestra nueva?" y leer 6
+ * bytes por cada una. Así se alcanzan los 1600 Hz:
+ *   - Sin FIFO, cada muestra costaba ~2 ms de I2C y esperas: el máximo real
+ *     era ~350 Hz, y las muestras que el sensor sobrescribía no se notaban.
+ *   - Con FIFO, a 1600 Hz cada lectura trae ~8 muestras (56 bytes) cada 5 ms,
+ *     y si el envío se atrasa, la FIFO guarda hasta ~180 ms de muestras.
+ *   - Por eso el bus I2C va a 400 kHz (I2C_MASTER_FREQ_HZ): a 1600 Hz son
+ *     ~11 KB/s, lo máximo que mueve un bus de 100 kHz. A 400 kHz usa ~25 %.
  *
- * Devuelve ESP_ERR_NOT_FINISHED si todavía no hay una muestra nueva: eso no
- * es un fallo. Cualquier otro error sí lo es. */
-static esp_err_t bmi270_read_raw(int16_t *ax, int16_t *ay, int16_t *az) {
+ * Registros (datasheet del BMI270 y bmi2_defs.h de Bosch): */
+#define REG_FIFO_LENGTH         0x24    // 2 bytes: bytes guardados (14 bits)
+#define REG_FIFO_DATA           0x26    // leer aquí en ráfaga entrega la FIFO
+#define REG_FIFO_DOWNS          0x45
+#define REG_FIFO_CONFIG_0       0x48
+#define REG_FIFO_CONFIG_1       0x49
+#define REG_CMD                 0x7E
+
+#define FIFO_DOWNS_FILTERED     0x88    // muestras filtradas a la frecuencia elegida (acc y gyr),
+                                        // no las crudas a 1600 Hz fijos
+#define FIFO_CONFIG_0_STREAM    0x00    // llena: se pierden las más antiguas (y lo avisa)
+#define FIFO_CONFIG_1_ACC_HDR   0x50    // 0x40 solo acelerómetro + 0x10 con encabezados
+#define CMD_FIFO_FLUSH          0xB0    // vaciar la FIFO
+
+/* Encabezados de los "frames" (bloques) que salen de la FIFO */
+#define FRAME_ACC               0x84    // + 6 bytes: x, y, z (int16 little-endian)
+#define FRAME_SKIP              0x40    // + 1 byte: cuántas muestras se perdieron por FIFO llena
+#define FRAME_SENSORTIME        0x44    // + 3 bytes (no se usa, pero hay que saltarlo)
+#define FRAME_CONFIG_CHANGE     0x48    // + 4 bytes (no se usa, pero hay que saltarlo)
+#define FRAME_OVER_READ         0x80    // ya no hay más datos
+
+#define FIFO_SIZE               2048
+#define FIFO_MAX_FRAMES         (FIFO_SIZE / 7)     // 7 bytes por muestra con su encabezado
+
+static uint8_t s_fifo_buf[FIFO_SIZE];               // lo leído de la FIFO
+static data_msg_t s_batch[FIFO_MAX_FRAMES];         // las muestras listas para enviar
+/* Auxiliares de fifo_take(). Son static (no van en el stack) porque juntas
+ * ocupan ~4 KB, todo el stack de read_task en el modo paralelo. */
+static int16_t s_raw[FIFO_MAX_FRAMES][3];           // x, y, z de cada muestra leída
+static int64_t s_t_us[FIFO_MAX_FRAMES];             // su t_us
+static int64_t s_last_t_us = -1;                    // t_us de la última muestra (-1: ninguna)
+static int64_t s_session_start_us = 0;              // cuándo empezó la sesión (para el modo por tiempo)
+static int64_t s_period_us = 0;                     // periodo nominal: 1 / frecuencia
+
+/* Escribe un registro de 1 byte del BMI270. */
+static esp_err_t write_reg(uint8_t reg, uint8_t value) {
+    return device_write(s_dev, &reg, &value, 1, TAG);
+}
+
+/* Prepara la FIFO al empezar una sesión: solo acelerómetro, con
+ * encabezados, y la vacía para que no queden muestras de antes. */
+static esp_err_t fifo_start(int odr_macro) {
+    s_period_us = (odr_macro == BMI270_ODR_12_5) ? 80000 : 1000000 / odr_macro;
+    s_last_t_us = -1;
+
+    esp_err_t err = write_reg(REG_FIFO_DOWNS, FIFO_DOWNS_FILTERED);
+    if (err == ESP_OK) err = write_reg(REG_FIFO_CONFIG_0, FIFO_CONFIG_0_STREAM);
+    if (err == ESP_OK) err = write_reg(REG_FIFO_CONFIG_1, FIFO_CONFIG_1_ACC_HDR);
+    if (err == ESP_OK) err = write_reg(REG_CMD, CMD_FIFO_FLUSH);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    return err;
+}
+
+/* Les pone t_us a las `n` muestras recién leídas. El sensor no dice CUÁNDO
+ * tomó cada una, pero sí que van una cada periodo (s_period_us). Se usa:
+ *   - La más nueva se tomó hace "medio intervalo" antes de leer, en promedio
+ *     (el intervalo es el periodo, o FIFO_POLL_MS si este es más corto).
+ *   - La primera vez se cuenta hacia atrás desde ahí, un periodo por muestra.
+ *   - Después, cada muestra va un periodo después de la anterior, más una
+ *     pequeña corrección: una fracción (1/TIME_SMOOTHING) de lo que la cuenta
+ *     se desvió de la estimación. Así el intervalo queda casi constante, nunca
+ *     va hacia atrás, y en promedio sigue al reloj del ESP32 (si el sensor va
+ *     1 % rápido, se nota en el intervalo medio).
+ * Las `skipped` (perdidas en el sensor) también ocupan su lugar en el tiempo.
+ * Si la cuenta quedó MUY atrás (por ejemplo, después de que la FIFO se llenó
+ * porque el envío se atrasó), se vuelve a anclar al reloj de una vez. */
+#define TIME_SMOOTHING          8
+#define TIME_REANCHOR_US        20000   // atraso que ya no se corrige de a poco
+
+/* Cuándo se tomó, en promedio, la muestra más nueva de una lectura hecha en
+ * t_read_us: medio intervalo antes (el periodo, o FIFO_POLL_MS si es menor). */
+static int64_t newest_sample_us(int64_t t_read_us) {
+    int64_t poll_us = (int64_t)FIFO_POLL_MS * 1000;
+    return t_read_us - (s_period_us < poll_us ? s_period_us : poll_us) / 2;
+}
+
+static void stamp_batch(int n, uint32_t skipped, int64_t t_read_us, int64_t *t_us) {
+    int64_t newest = newest_sample_us(t_read_us);   // estimación para la más nueva
+    int64_t steps = (int64_t)skipped + n;
+    int64_t error = (s_last_t_us < 0) ? 0 : newest - (s_last_t_us + steps * s_period_us);
+
+    if (s_last_t_us < 0 || error > TIME_REANCHOR_US) {
+        /* Primera vez, o muy atrasados: contar hacia atrás desde la más nueva
+         * (sin pasar por encima de la última muestra ya enviada). */
+        int64_t first = newest - (int64_t)(n - 1) * s_period_us;
+        if (s_last_t_us >= 0 && first <= s_last_t_us) {
+            first = s_last_t_us + s_period_us;
+        }
+        for (int i = 0; i < n; i++) {
+            t_us[i] = first + (int64_t)i * s_period_us;
+        }
+    } else {
+        int64_t step = s_period_us + error / (steps * TIME_SMOOTHING);
+        if (step < s_period_us / 2) step = s_period_us / 2;     // nunca apretar de más ni retroceder
+        if (step > s_period_us * 2) step = s_period_us * 2;     // ni estirar de más
+        for (int i = 0; i < n; i++) {
+            t_us[i] = s_last_t_us + step * ((int64_t)skipped + i + 1);
+        }
+    }
+    s_last_t_us = t_us[n - 1];
+}
+
+/* Una vuelta de lectura: vacía la FIFO y deja en s_batch las muestras ya
+ * numeradas (seq) y con su t_us, listas para enviar. *n = cuántas. *done se
+ * pone en true cuando la sesión llegó a su límite (N muestras o T segundos).
+ * Las muestras perdidas en el sensor (FIFO llena) igual avanzan seq: el
+ * servidor ve el hueco y las cuenta como perdidas. */
+static esp_err_t fifo_take(const control_config_t *cfg, uint32_t *seq, int *n, bool *done) {
+    *n = 0;
     if (!is_bmi270_active) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t reg_status = 0x03, status;
-    uint8_t reg_data = 0x0C, buf[6];        // 6 bytes: solo el acelerómetro
-
-    esp_err_t err = device_read(s_dev, &reg_status, &status, 1, TAG);
+    /* 1. ¿Cuántos bytes hay? */
+    uint8_t reg = REG_FIFO_LENGTH, len_buf[2];
+    esp_err_t err = device_read(s_dev, &reg, len_buf, 2, TAG);
     if (err != ESP_OK) {
         return err;
     }
-    if ((status & 0x80) == 0) {             // bit 7: hay muestra nueva de aceleración
-        return ESP_ERR_NOT_FINISHED;
+    int64_t t_read_us = esp_timer_get_time();
+    size_t length = len_buf[0] | ((size_t)(len_buf[1] & 0x3F) << 8);
+    if (length > FIFO_SIZE) {
+        length = FIFO_SIZE;
     }
 
-    err = device_read(s_dev, &reg_data, buf, sizeof(buf), TAG);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    *ax = (int16_t)(((uint16_t)buf[1] << 8) | buf[0]);
-    *ay = (int16_t)(((uint16_t)buf[3] << 8) | buf[2]);
-    *az = (int16_t)(((uint16_t)buf[5] << 8) | buf[4]);
-    return ESP_OK;
-}
-
-/* Espera la próxima muestra del sensor y arma el mensaje número `seq`.
- * Devuelve ESP_OK, o un error si el sensor falla o deja de entregar datos
- * (para que una sesión nunca se quede esperando para siempre). */
-static esp_err_t wait_sample(uint32_t seq, data_msg_t *msg) {
-    int64_t start = esp_timer_get_time();
-    while (true) {
-        int16_t ax, ay, az;
-        esp_err_t err = bmi270_read_raw(&ax, &ay, &az);
-        if (err == ESP_OK) {
-            msg->seq = seq;
-            msg->t_us = (uint32_t)esp_timer_get_time();
-            msg->ax = ax;
-            msg->ay = ay;
-            msg->az = az;
-            return ESP_OK;
-        }
-        if (err != ESP_ERR_NOT_FINISHED) {
+    /* 2. Leerlos todos en una sola transferencia */
+    int frames = 0;
+    uint32_t skipped = 0;
+    bool saturated = false;         // el sensor cuenta hasta 255 perdidas: pudieron ser más
+    if (length > 0) {
+        reg = REG_FIFO_DATA;
+        err = device_read(s_dev, &reg, s_fifo_buf, length, TAG);
+        if (err != ESP_OK) {
             return err;
         }
-        if (esp_timer_get_time() - start > NO_DATA_TIMEOUT_US) {
-            return ESP_ERR_TIMEOUT;
+
+        /* 3. Separar los frames. Si el último quedó cortado, se descarta:
+         *    el sensor lo vuelve a entregar completo en la próxima lectura. */
+        size_t i = 0;
+        while (i < length) {
+            uint8_t header = s_fifo_buf[i] & 0xFC;  // los 2 bits bajos son marcas de interrupción
+            size_t size;
+            if (header == FRAME_ACC)                size = 6;
+            else if (header == FRAME_SKIP)          size = 1;
+            else if (header == FRAME_SENSORTIME)    size = 3;
+            else if (header == FRAME_CONFIG_CHANGE) size = 4;
+            else if (header == FRAME_OVER_READ)     break;
+            else {
+                ESP_LOGW(TAG, "FIFO: encabezado desconocido 0x%02x, se descarta el resto", s_fifo_buf[i]);
+                break;
+            }
+            if (i + 1 + size > length) {
+                break;                              // frame cortado
+            }
+            const uint8_t *p = &s_fifo_buf[i + 1];
+            if (header == FRAME_ACC && frames < FIFO_MAX_FRAMES) {
+                s_raw[frames][0] = (int16_t)(((uint16_t)p[1] << 8) | p[0]);
+                s_raw[frames][1] = (int16_t)(((uint16_t)p[3] << 8) | p[2]);
+                s_raw[frames][2] = (int16_t)(((uint16_t)p[5] << 8) | p[4]);
+                frames++;
+            } else if (header == FRAME_SKIP) {
+                skipped += p[0];
+                saturated = saturated || p[0] == 0xFF;
+            }
+            i += 1 + size;
         }
-        vTaskDelay(1);      // un tick: 1 ms con CONFIG_FREERTOS_HZ=1000
     }
+
+    /* 4. Si el contador de perdidas llegó a 255, se estima cuántas fueron por
+     *    el tiempo que pasó: (tiempo desde la última muestra) / periodo. */
+    if (saturated && frames > 0 && s_last_t_us >= 0) {
+        int64_t gap = newest_sample_us(t_read_us) - s_last_t_us;
+        int64_t estimate = gap / s_period_us - frames;
+        if (estimate > (int64_t)skipped) {
+            skipped = (uint32_t)estimate;
+        }
+    }
+
+    /* 5. Numerar y poner la hora */
+    if (frames > 0) {
+        stamp_batch(frames, skipped, t_read_us, s_t_us);
+    }
+    if (skipped > 0) {
+        ESP_LOGW(TAG, "FIFO llena: el sensor descarto %lu muestras", (unsigned long)skipped);
+        *seq += skipped;
+        if (cfg->stop_mode == STOP_BY_COUNT && *seq >= cfg->limit) {
+            *seq = cfg->limit;
+            *done = true;
+            return ESP_OK;
+        }
+    }
+    int64_t end_us = s_session_start_us + (int64_t)cfg->limit * 1000;   // modo por tiempo
+    for (int k = 0; k < frames; k++) {
+        if (cfg->stop_mode == STOP_BY_COUNT ? *seq >= cfg->limit : s_t_us[k] >= end_us) {
+            *done = true;
+            return ESP_OK;
+        }
+        data_msg_t *msg = &s_batch[*n];
+        msg->seq = *seq;
+        msg->t_us = (uint32_t)s_t_us[k];
+        msg->ax = s_raw[k][0];
+        msg->ay = s_raw[k][1];
+        msg->az = s_raw[k][2];
+        (*seq)++;
+        (*n)++;
+    }
+    /* Por tiempo: si ya pasó T al leer, todo lo anterior a T ya está leído */
+    if ((cfg->stop_mode == STOP_BY_COUNT && *seq >= cfg->limit) ||
+        (cfg->stop_mode == STOP_BY_TIME && t_read_us >= end_us)) {
+        *done = true;
+    }
+    return ESP_OK;
 }
 
 /* Revisa el CONFIG como lo hace validate() en esp_test.py. Devuelve el código
@@ -1502,21 +1680,6 @@ static uint8_t validate_config(const control_config_t *cfg, int *odr_macro) {
     return ACK_OK;
 }
 
-/* Momento en que empezó la adquisición (esp_timer_get_time, en µs). Lo fija
- * run_acquisition justo antes de leer la primera muestra. */
-static int64_t s_session_start_us = 0;
-
-/* ¿Hay que tomar otra muestra? `seq` es cuántas se han tomado hasta ahora.
- * Por cantidad: mientras falten muestras. Por tiempo: mientras no hayan pasado
- * `limit` ms desde el inicio. Se revisa ANTES de esperar cada muestra, así que
- * la última puede llegar hasta un periodo después del límite (10 ms a 100 Hz). */
-static bool session_running(const control_config_t *cfg, uint32_t seq) {
-    if (cfg->stop_mode == STOP_BY_COUNT) {
-        return seq < cfg->limit;
-    }
-    return esp_timer_get_time() - s_session_start_us < (int64_t)cfg->limit * 1000;
-}
-
 /* Programa en el acelerómetro el rango y la frecuencia de la sesión. El sensor
  * ya está inicializado desde el arranque: acá solo se reescriben esos dos
  * registros, así que no hace falta repetir bmi270_init(). */
@@ -1526,17 +1689,13 @@ static bool apply_sensor_config(const control_config_t *cfg, int odr_macro) {
         ESP_LOGE(TAG, "No se pudo configurar el acelerometro: %s", esp_err_to_name(ret));
         return false;
     }
-
-    /* Descarta una muestra que pudo quedar lista con la configuración anterior. */
-    int16_t ax, ay, az;
-    bmi270_read_raw(&ax, &ay, &az);
     return true;
 }
 
 
 /* --------------------------- Modo paralelo --------------------------- */
 
-/* Dos tareas unidas por una cola: read_task lee el sensor a su ritmo y deja
+/* Dos tareas unidas por una cola: read_task vacía la FIFO a su ritmo y deja
  * cada muestra en la cola; la tarea principal las saca y las envía. Un envío
  * lento ya no atrasa la lectura.
  *
@@ -1553,23 +1712,37 @@ static bool s_stopped = false;                  // la sesión terminó por un ST
 static void parallel_read_task(void *arg) {
     const control_config_t *cfg = (const control_config_t *)arg;
     uint32_t seq = 0;
+    bool done = false;
+    int64_t last_data_us = esp_timer_get_time();
 
-    while (session_running(cfg, seq) && !s_stop_reader) {
-        data_msg_t msg;
-        esp_err_t err = wait_sample(seq, &msg);
+    while (!done && !s_stop_reader) {
+        int n;
+        esp_err_t err = fifo_take(cfg, &seq, &n, &done);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Lectura del sensor fallo: %s", esp_err_to_name(err));
             s_reader_failed = true;
             break;
         }
-        seq++;
         s_taken = seq;
 
-        /* Sin espera: si la cola está llena, la muestra se descarta. Como seq
-         * ya avanzó, el servidor verá el hueco y lo contará como pérdida.
+        /* Sin espera: si la cola está llena, la muestra se descarta. Como ya
+         * tiene su seq, el servidor verá el hueco y lo contará como pérdida.
          * (Esperar acá frenaría la lectura, y la pérdida quedaría oculta.) */
-        if (xQueueSend(s_data_queue, &msg, 0) != pdTRUE) {
-            s_dropped++;
+        for (int i = 0; i < n; i++) {
+            if (xQueueSend(s_data_queue, &s_batch[i], 0) != pdTRUE) {
+                s_dropped++;
+            }
+        }
+
+        if (n > 0) {
+            last_data_us = esp_timer_get_time();
+        } else if (esp_timer_get_time() - last_data_us > NO_DATA_TIMEOUT_US) {
+            ESP_LOGE(TAG, "El sensor no entrega muestras");
+            s_reader_failed = true;
+            break;
+        }
+        if (!done) {
+            vTaskDelay(pdMS_TO_TICKS(FIFO_POLL_MS));
         }
     }
 
@@ -1650,35 +1823,51 @@ static uint32_t run_parallel(int data_sock, int control_sock, const control_conf
 
 /* --------------------------- Modo secuencial ------------------------- */
 
-/* Una sola tarea lee y envía, una cosa después de la otra. Si un envío se
- * demora, la siguiente lectura se atrasa. Devuelve cuántas muestras se
- * tomaron y deja en *sent cuántas se enviaron. */
+/* Una sola tarea lee y envía, una cosa después de la otra: vacía la FIFO,
+ * envía esas muestras y vuelve a leer. Si un envío se demora, la FIFO del
+ * sensor guarda lo que llega mientras tanto (hasta ~180 ms a 1600 Hz).
+ * Devuelve cuántas muestras se tomaron y deja en *sent cuántas se enviaron. */
 static uint32_t run_sequential(int data_sock, int control_sock, const control_config_t *cfg,
                                const struct sockaddr_in *dest, uint32_t *sent, bool *ok) {
     uint32_t seq = 0;
+    bool done = false;
+    int64_t last_data_us = esp_timer_get_time();
     *sent = 0;
 
-    while (session_running(cfg, seq)) {
+    while (!done) {
         if (stop_requested(control_sock)) {
             s_stopped = true;
             break;
         }
 
-        data_msg_t msg;
-        esp_err_t err = wait_sample(seq, &msg);
+        int n;
+        esp_err_t err = fifo_take(cfg, &seq, &n, &done);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Lectura del sensor fallo: %s", esp_err_to_name(err));
             *ok = false;
             break;
         }
-        seq++;
 
-        if (!send_sample(data_sock, cfg->transport, dest, &msg)) {
-            ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
+        for (int i = 0; i < n; i++) {
+            if (!send_sample(data_sock, cfg->transport, dest, &s_batch[i])) {
+                ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
+                *ok = false;
+                done = true;
+                break;
+            }
+            (*sent)++;
+        }
+
+        if (n > 0) {
+            last_data_us = esp_timer_get_time();
+        } else if (esp_timer_get_time() - last_data_us > NO_DATA_TIMEOUT_US) {
+            ESP_LOGE(TAG, "El sensor no entrega muestras");
             *ok = false;
             break;
         }
-        (*sent)++;
+        if (!done) {
+            vTaskDelay(pdMS_TO_TICKS(FIFO_POLL_MS));
+        }
     }
     return seq;
 }
@@ -1687,7 +1876,7 @@ static uint32_t run_sequential(int data_sock, int control_sock, const control_co
 /* ------------------------------ Sesión ------------------------------- */
 
 /* Canal de datos: abre el socket, envía las muestras y avisa el final. */
-static void run_acquisition(int control_sock, const control_config_t *cfg,
+static void run_acquisition(int control_sock, const control_config_t *cfg, int odr_macro,
                             const struct sockaddr_in *server_addr) {
     struct sockaddr_in dest = *server_addr;
     dest.sin_port = htons(DATA_PORT);
@@ -1713,26 +1902,36 @@ static void run_acquisition(int control_sock, const control_config_t *cfg,
     uint32_t taken, sent;
     s_udp_send_errors = 0;
     s_stopped = false;
-    s_session_start_us = esp_timer_get_time();     // aquí empieza a correr el tiempo
 
-    if (cfg->read_mode == MODE_SEQUENTIAL) {
-        taken = run_sequential(data_sock, control_sock, cfg, &dest, &sent, &ok);
+    if (fifo_start(odr_macro) != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo preparar la FIFO del sensor");
+        ok = false;
+        taken = sent = 0;
     } else {
-        taken = run_parallel(data_sock, control_sock, cfg, &dest, &sent, &ok);
+        s_session_start_us = esp_timer_get_time();     // aquí empieza a correr el tiempo
+        if (cfg->read_mode == MODE_SEQUENTIAL) {
+            taken = run_sequential(data_sock, control_sock, cfg, &dest, &sent, &ok);
+        } else {
+            taken = run_parallel(data_sock, control_sock, cfg, &dest, &sent, &ok);
+        }
     }
     double seconds = (esp_timer_get_time() - s_session_start_us) / 1e6;
 
-    /* Fin de la sesión. Con UDP no existe "cerrar", así que se avisa con END
-     * por el canal de control, que es TCP y no se pierde. Se envía aunque la
-     * sesión haya terminado mal, para que el servidor no se quede esperando.
-     * Lleva el total de muestras tomadas: en el modo por tiempo es la única
-     * forma de que el servidor sepa cuántas esperar (y cuántas se perdieron).
-     * Con TCP, cerrar la conexión de datos ya es el aviso. */
-    if (cfg->transport == TRANSPORT_UDP) {
-        end_msg_t end_msg = { .code = END_CODE, .total = taken };
-        if (!send_all(control_sock, &end_msg, sizeof(end_msg))) {
-            ESP_LOGW(TAG, "No se pudo enviar END por el canal de control");
-        }
+    /* Fin de la sesión: END por el canal de control, con TCP y con UDP.
+     * - Dice CÓMO terminó: completa, detenida por STOP o con una falla. Con
+     *   TCP, cerrar la conexión de datos no basta: el servidor no podría
+     *   distinguir un final normal de uno temprano.
+     * - Lleva el total de muestras tomadas: en el modo por tiempo es la única
+     *   forma de que el servidor sepa cuántas esperar (y cuántas se perdieron).
+     * Se envía aunque la sesión haya terminado mal, para que el servidor no se
+     * quede esperando. Después, con TCP, se cierra la conexión de datos. */
+    end_msg_t end_msg = {
+        .code = END_CODE,
+        .result = !ok ? END_FAILED : (s_stopped ? END_STOPPED : END_COMPLETED),
+        .total = taken,
+    };
+    if (!send_all(control_sock, &end_msg, sizeof(end_msg))) {
+        ESP_LOGW(TAG, "No se pudo enviar END por el canal de control");
     }
     close(data_sock);
 
@@ -1784,7 +1983,7 @@ static bool handle_control(int control_sock, const struct sockaddr_in *server_ad
             return had_session;
         }
 
-        run_acquisition(control_sock, &cfg, server_addr);
+        run_acquisition(control_sock, &cfg, odr_macro, server_addr);
         had_session = true;
 
         if (ONE_SESSION_PER_BOOT) {
@@ -1821,7 +2020,7 @@ void app_main(void) {
     /* 3. WiFi. */
     if (strcmp(WIFI_SSID, "TU_WIFI") == 0) {
         ESP_LOGE(TAG, "Falta configurar la red: edita main/secrets.h con el nombre y la");
-        ESP_LOGE(TAG, "clave de tu WiFi y la IP del computador que corre server.py.");
+        ESP_LOGE(TAG, "clave de tu WiFi y la IP del computador que corre web_server.py.");
         return;
     }
     wifi_init_sta();

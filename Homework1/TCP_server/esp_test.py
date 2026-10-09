@@ -5,6 +5,9 @@ early when the server sends STOP. It exits when the server closes the control
 connection.
 
 usage: python esp_test.py [clean|reset|silent]
+    clean   (default) every session ends normally, with END
+    reset   simulates a crash: no END (and RST on a TCP data connection)
+    silent  after the samples, sends nothing more (no END) and waits
 """
 import select
 import socket
@@ -18,7 +21,7 @@ from protocol import (MSG_FMT, U32_MASK, CONFIG_FMT, CONFIG_SIZE, Config,
                       STOP_BY_COUNT, STOP_BY_TIME, MAX_DURATION_MS,
                       ACK_FMT, ACK_OK, ERR_RANGE, ERR_RATE, ERR_TRANSPORT,
                       ERR_MODE, ERR_SAMPLES, ERR_STOP, ERR_DURATION, STATUS_TEXT,
-                      END_FMT, END_CODE, STOP_CODE)
+                      END_FMT, END_CODE, END_COMPLETED, END_STOPPED, STOP_CODE)
 from data_channel import recv_exact, ClientClosed
 
 HOST = '127.0.0.1'        # the RPi's IP address when testing over the network
@@ -137,18 +140,20 @@ def run_session(control, config, mode):
         if stopped:
             print(f"STOP received after {seq} samples")
 
-        # 3. END of the session
+        # 3. END of the session (TCP and UDP), unless simulating a failure
         if mode == 'silent':
             print("Going silent, without END... (Ctrl+C to quit)")
             time.sleep(3600)
-        elif use_udp:
-            control.sendall(struct.pack(END_FMT, END_CODE, seq))   # seq = samples taken
-            print(f"END sent on the control channel ({seq} samples taken)")
         elif mode == 'reset':
-            data.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            print("Closing with RST")
+            if not use_udp:
+                data.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            print("Simulating a crash: no END" + ("" if use_udp else ", data closed with RST"))
+            sys.exit(1)
         else:
-            print("Closing cleanly (FIN)")
+            result = END_STOPPED if stopped else END_COMPLETED
+            control.sendall(struct.pack(END_FMT, END_CODE, result, seq))   # seq = samples taken
+            print(f"END sent on the control channel ({seq} samples taken)"
+                  + ("" if use_udp else ", then closing the data connection (FIN)"))
 
 
 mode = sys.argv[1] if len(sys.argv) > 1 else 'clean'
