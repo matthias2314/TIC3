@@ -1,0 +1,23 @@
+{
+  "started": "2026-10-08T22:32:15",
+  "config": {
+    "range_g": 16,
+    "rate_hz": 1600.0,
+    "transport": "udp",
+    "mode": "sequential",
+    "stop": "time",
+    "num_samples": null,
+    "duration_s": 5.0
+  },
+  "csv_file": "session_20261008_223215_udp.csv",
+  "stats": {
+    "expected": 1237,
+    "received": 1027,
+    "late": 0,
+    "duplicates": 0,
+    "missing": 210,
+    "lost": 210,
+    "loss_pct": 16.976556184316895,
+    "result": "stopped"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "started": "2026-10-08T22:29:11",
+  "config": {
+    "range_g": 16,
+    "rate_hz": 800.0,
+    "transport": "tcp",
+    "mode": "parallel",
+    "stop": "time",
+    "num_samples": null,
+    "duration_s": 5.0
+  },
+  "csv_file": "session_20261008_222911_tcp.csv",
+  "stats": {
+    "expected": 4044,
+    "received": 4044,
+    "late": 0,
+    "duplicates": 0,
+    "missing": 0,
+    "lost": 0,
+    "loss_pct": 0.0,
+    "result": "completed"
+  }
+}

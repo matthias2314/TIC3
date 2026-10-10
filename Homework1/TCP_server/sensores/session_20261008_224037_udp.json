@@ -1,0 +1,23 @@
+{
+  "started": "2026-10-08T22:40:37",
+  "config": {
+    "range_g": 16,
+    "rate_hz": 1600.0,
+    "transport": "udp",
+    "mode": "parallel",
+    "stop": "time",
+    "num_samples": null,
+    "duration_s": 1.0
+  },
+  "csv_file": "session_20261008_224037_udp.csv",
+  "stats": {
+    "expected": 1618,
+    "received": 1331,
+    "late": 0,
+    "duplicates": 0,
+    "missing": 287,
+    "lost": 287,
+    "loss_pct": 17.737948084054388,
+    "result": "completed"
+  }
+}
