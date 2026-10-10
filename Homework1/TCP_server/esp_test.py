@@ -33,6 +33,8 @@ SKIP_SEQ = 5              # never sent: "lost"                  (TCP and UDP)
 DUPLICATE_SEQ = 8         # sent twice                          (UDP only)
 LATE_SEQ = 10             # sent after LATE_SEQ + 1: "late"     (UDP only)
 
+SAMPLES_PER_DATAGRAM = 8  # UDP: samples that travel together in one datagram
+
 
 def validate(config):
     """Check the config like the real firmware will. Returns a status code."""
@@ -102,10 +104,19 @@ def run_session(control, config, mode):
     sock_type = socket.SOCK_DGRAM if use_udp else socket.SOCK_STREAM
     with socket.socket(socket.AF_INET, sock_type) as data:
         if use_udp:
+            waiting = []                                 # samples for the next datagram
+            def flush():
+                if waiting:
+                    data.sendto(b"".join(waiting), (HOST, DATA_PORT))   # address on every datagram
+                    waiting.clear()
             def send(packet):
-                data.sendto(packet, (HOST, DATA_PORT))   # address on every datagram
+                waiting.append(packet)
+                if len(waiting) >= SAMPLES_PER_DATAGRAM:
+                    flush()
         else:
             data.connect((HOST, DATA_PORT))
+            def flush():
+                pass                                     # TCP groups the bytes by itself
             def send(packet):
                 data.sendall(packet)
 
@@ -137,6 +148,7 @@ def run_session(control, config, mode):
             seq += 1
             time.sleep(period)
 
+        flush()                                          # the samples still waiting
         if stopped:
             print(f"STOP received after {seq} samples")
 

@@ -1253,6 +1253,7 @@ esp_err_t bmi270_deinit(void) {
 #define NO_DATA_TIMEOUT_US      2000000 // si el sensor no entrega nada en 2 s, se corta la sesión
 #define PARALLEL_QUEUE_LEN      512     // muestras que caben en la cola del modo paralelo
 #define FIFO_POLL_MS            5       // cada cuánto se vacía la FIFO del sensor
+#define MAX_SAMPLES_PER_DATAGRAM 100    // UDP: 100 x 14 = 1400 bytes, cabe en un frame (máx. 1472)
 
 /* Los dos mensajes binarios. `packed` evita que el compilador agregue relleno:
  * sin él, la muestra mediría 16 bytes en vez de 14 y el servidor leería basura.
@@ -1368,18 +1369,31 @@ static bool send_all(int sock, const void *buf, size_t len) {
 
 static uint32_t s_udp_send_errors = 0;
 
-/* Envía una muestra por el canal de datos. Devuelve false solo si hay que
- * cortar la sesión (la conexión TCP se cayó). */
-static bool send_sample(int data_sock, uint8_t transport, const struct sockaddr_in *dest,
-                        const data_msg_t *msg) {
+/* Envía `count` muestras seguidas por el canal de datos. Devuelve false solo
+ * si hay que cortar la sesión (la conexión TCP se cayó).
+ *
+ * `msgs` es un arreglo de data_msg_t: como el struct es `packed`, en memoria
+ * son count x 14 bytes seguidos, sin relleno, y se pueden enviar tal cual. */
+static bool send_samples(int data_sock, uint8_t transport, const struct sockaddr_in *dest,
+                         const data_msg_t *msgs, int count) {
     if (transport == TRANSPORT_TCP) {
-        return send_all(data_sock, msg, sizeof(*msg));
+        return send_all(data_sock, msgs, (size_t)count * sizeof(data_msg_t));
     }
-    /* UDP: un datagrama por muestra. Si no se puede enviar (por ejemplo, con
-     * los buffers del WiFi llenos) la muestra simplemente se pierde, y el
-     * servidor lo verá como un hueco en seq. No es motivo para cortar. */
-    if (sendto(data_sock, msg, sizeof(*msg), 0, (const struct sockaddr *)dest, sizeof(*dest)) < 0) {
-        s_udp_send_errors++;
+    /* UDP: varias muestras por datagrama, hasta MAX_SAMPLES_PER_DATAGRAM. Con
+     * un datagrama por muestra el ESP32 no pasaba de ~800 por segundo, y a
+     * 1600 Hz se perdía la mitad antes de salir. Si un datagrama no se puede
+     * enviar (por ejemplo, con los buffers del WiFi llenos) esas muestras se
+     * pierden, y el servidor lo verá como un hueco en seq. No es motivo para
+     * cortar. */
+    for (int i = 0; i < count; i += MAX_SAMPLES_PER_DATAGRAM) {
+        int k = count - i;
+        if (k > MAX_SAMPLES_PER_DATAGRAM) {
+            k = MAX_SAMPLES_PER_DATAGRAM;
+        }
+        if (sendto(data_sock, &msgs[i], (size_t)k * sizeof(data_msg_t), 0,
+                   (const struct sockaddr *)dest, sizeof(*dest)) < 0) {
+            s_udp_send_errors++;
+        }
     }
     return true;
 }
@@ -1708,6 +1722,7 @@ static volatile bool s_reader_failed = false;   // el sensor falló en read_task
 static volatile uint32_t s_dropped = 0;         // muestras descartadas por cola llena
 static volatile uint32_t s_taken = 0;           // muestras que read_task leyó (seq final)
 static bool s_stopped = false;                  // la sesión terminó por un STOP del servidor
+static data_msg_t s_out[MAX_SAMPLES_PER_DATAGRAM];  // muestras sacadas de la cola, por enviar
 
 static void parallel_read_task(void *arg) {
     const control_config_t *cfg = (const control_config_t *)arg;
@@ -1782,15 +1797,21 @@ static uint32_t run_parallel(int data_sock, int control_sock, const control_conf
             s_stop_reader = true;
         }
 
-        data_msg_t msg;
         TickType_t wait = reader_finished ? 0 : pdMS_TO_TICKS(50);
-        if (xQueueReceive(s_data_queue, &msg, wait) == pdTRUE) {
-            if (!send_sample(data_sock, cfg->transport, dest, &msg)) {
+        if (xQueueReceive(s_data_queue, &s_out[0], wait) == pdTRUE) {
+            /* Llegó una: se sacan también las que ya estén esperando (sin
+             * esperar por más) y se envían todas juntas. */
+            int count = 1;
+            while (count < MAX_SAMPLES_PER_DATAGRAM &&
+                   xQueueReceive(s_data_queue, &s_out[count], 0) == pdTRUE) {
+                count++;
+            }
+            if (!send_samples(data_sock, cfg->transport, dest, s_out, count)) {
                 ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
                 *ok = false;
                 break;
             }
-            (*sent)++;
+            *sent += (uint32_t)count;
             continue;
         }
         if (reader_finished) {
@@ -1848,15 +1869,13 @@ static uint32_t run_sequential(int data_sock, int control_sock, const control_co
             break;
         }
 
-        for (int i = 0; i < n; i++) {
-            if (!send_sample(data_sock, cfg->transport, dest, &s_batch[i])) {
-                ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
-                *ok = false;
-                done = true;
-                break;
-            }
-            (*sent)++;
+        /* Todas las muestras de esta lectura de la FIFO se envían juntas */
+        if (n > 0 && !send_samples(data_sock, cfg->transport, dest, s_batch, n)) {
+            ESP_LOGE(TAG, "Fallo el envio de datos (errno %d)", errno);
+            *ok = false;
+            break;
         }
+        *sent += (uint32_t)n;
 
         if (n > 0) {
             last_data_us = esp_timer_get_time();

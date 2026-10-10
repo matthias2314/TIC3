@@ -192,14 +192,18 @@ def receive_samples_tcp(sock, control, config, consumers, finishers):
 
 
 def read_datagram(sock, esp_ip, tracker, consumers):
-    """Read one datagram and handle it if it is a sample from esp_ip."""
+    """Read one datagram from esp_ip and handle every sample in it. A datagram
+    carries one or more samples back to back (14 bytes each): sending them
+    one per datagram is too slow for the ESP32 at high rates."""
     msg, (src_ip, _) = sock.recvfrom(UDP_BUFFER)
     if src_ip != esp_ip:
         print(f"Ignoring datagram from {src_ip}")
-    elif len(msg) != MSG_SIZE:
-        print(f"Ignoring datagram of {len(msg)} bytes (expected {MSG_SIZE})")
+    elif len(msg) == 0 or len(msg) % MSG_SIZE != 0:
+        print(f"Ignoring datagram of {len(msg)} bytes (not a whole number of "
+              f"{MSG_SIZE}-byte samples)")
     else:
-        handle_message(msg, tracker, consumers)
+        for start in range(0, len(msg), MSG_SIZE):
+            handle_message(msg[start:start + MSG_SIZE], tracker, consumers)
 
 
 def receive_samples_udp(udp_sock, control, esp_ip, config, consumers, finishers):
