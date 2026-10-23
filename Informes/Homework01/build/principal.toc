@@ -1,0 +1,16 @@
+\babel@toc {spanish}{}\relax 
+\contentsline {chapter}{Resumen}{\es@scroman {i}}{chapter*.1}%
+\contentsline {chapter}{\numberline {1}Introducción y requisitos}{1}{chapter.1}%
+\contentsline {chapter}{\numberline {2}Arquitectura y protocolo}{1}{chapter.2}%
+\contentsline {chapter}{\numberline {3}Firmware del ESP32: decisiones y cambios}{2}{chapter.3}%
+\contentsline {chapter}{\numberline {4}Servidor y GUI en la Raspberry Pi}{3}{chapter.4}%
+\contentsline {chapter}{\numberline {5}Resultados}{4}{chapter.5}%
+\contentsline {section}{\numberline {5.1}Rendimiento}{4}{section.5.1}%
+\contentsline {section}{\numberline {5.2}Comparación TCP vs UDP con Wireshark (RF9)}{4}{section.5.2}%
+\contentsline {section}{\numberline {5.3}Efecto del rango y de la frecuencia}{5}{section.5.3}%
+\contentsline {chapter}{\numberline {6}Limitaciones y conclusiones}{6}{chapter.6}%
+\contentsline {chapter}{\numberline {A}Anexos}{7}{appendix.Alph1}%
+\contentsline {section}{\numberline {A.1}Interfaz web}{7}{section.Alph1.1}%
+\contentsline {section}{\numberline {A.2}Capturas de Wireshark}{8}{section.Alph1.2}%
+\contentsline {section}{\numberline {A.3}Sesiones de prueba en \texttt {sensores/}}{8}{section.Alph1.3}%
+\contentsline {section}{\numberline {A.4}Uso de herramientas de IA}{8}{section.Alph1.4}%
